@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "subtitld-addon-voxcpm"
+version = "0.0.1"
+description = "Subtitld add-on: text-to-speech and voice cloning with OpenBMB's VoxCPM2"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Subtitld", email = "jbopen@gmail.com" }]
+# VoxCPM supports Python 3.10 to 3.12.
+requires-python = ">=3.10,<3.13"
+
+# What VoxCPM's inference path imports. `voxcpm` itself is installed with
+# --no-deps (see README): its own requirements add gradio, funasr, modelscope,
+# datasets and matplotlib for the web demo, training and denoising, none of
+# which synthesis touches. Versions are pinned in constraints.txt.
+dependencies = [
+    "torch>=2.5",
+    "torchaudio>=2.5",
+    "transformers>=4.36.2",
+    "tokenizers",
+    "safetensors",
+    "huggingface-hub",
+    "einops",
+    "pydantic>=2",
+    "tqdm",
+    "librosa",
+    "soundfile",
+    "numpy",
+    "certifi",
+]
+
+[project.optional-dependencies]
+build = ["pyinstaller>=6.10"]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+voxcpm-addon = "voxcpm_addon.__main__:main"
+
+[tool.setuptools]
+packages = ["voxcpm_addon"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["weights: needs the 4.96 GB of VoxCPM2 weights (local runs only)"]

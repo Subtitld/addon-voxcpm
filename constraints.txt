@@ -1,0 +1,23 @@
+# The versions the add-on was built and tested with. Install with
+#   pip install -e '.[build,dev]' -c constraints.txt
+#   pip install --no-deps -c constraints.txt voxcpm
+# On Linux and Windows add --extra-index-url https://download.pytorch.org/whl/cpu
+# so torch comes as its CPU-only build.
+voxcpm==2.0.3
+torch==2.14.1
+torchaudio==2.11.0
+transformers==5.20.1
+tokenizers==0.23.3
+safetensors==0.8.0
+huggingface-hub==2.2.0
+einops==0.8.2
+pydantic==2.14.1
+tqdm==4.70.1
+librosa==1.0.0
+numba==0.68.0
+llvmlite==0.50.0
+soundfile==0.14.0
+soxr==1.1.0
+numpy==2.5.4
+scipy==1.18.1
+certifi==2026.7.22

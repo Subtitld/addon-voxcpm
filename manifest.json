@@ -1,0 +1,219 @@
+{
+  "manifest_version": 1,
+  "id": "voxcpm",
+  "version": "0.0.1",
+  "display_name": "VoxCPM2 (offline, voice clone, 30 languages)",
+  "summary": "OpenBMB's VoxCPM2: speaks 30 languages at 48 kHz in the speaker's own voice, cloned from the video, or in a voice made from a description. Heavy: a 4.96 GB model downloaded on first use and about 7 GB of memory; on a CPU each second of speech takes several seconds to make.",
+  "author": "Subtitld",
+  "homepage": "https://github.com/Subtitld/addon-voxcpm",
+  "license": "Apache-2.0 (add-on, VoxCPM code and VoxCPM2 weights)",
+  "executable": "bin/voxcpm-addon",
+  "protocol": 1,
+  "startup_timeout_sec": 60,
+  "platforms": [
+    "linux",
+    "macos",
+    "windows"
+  ],
+  "tasks": [
+    "tts.synthesize"
+  ],
+  "voice_clone": true,
+  "languages": [
+    "ar",
+    "my",
+    "zh",
+    "da",
+    "nl",
+    "en",
+    "fi",
+    "fr",
+    "de",
+    "el",
+    "he",
+    "hi",
+    "id",
+    "it",
+    "ja",
+    "km",
+    "ko",
+    "lo",
+    "ms",
+    "no",
+    "pl",
+    "pt",
+    "ru",
+    "es",
+    "sw",
+    "sv",
+    "tl",
+    "th",
+    "tr",
+    "vi"
+  ],
+  "voices": [
+    {
+      "id": "voxcpm-clone",
+      "language": "*",
+      "display_name": "Speaker's own voice (cloned from the video)",
+      "requires": [
+        "voice_ref_audio"
+      ]
+    },
+    {
+      "id": "voxcpm-warm-woman",
+      "language": "*",
+      "display_name": "Warm woman"
+    },
+    {
+      "id": "voxcpm-young-woman",
+      "language": "*",
+      "display_name": "Bright young woman"
+    },
+    {
+      "id": "voxcpm-older-woman",
+      "language": "*",
+      "display_name": "Gentle older woman"
+    },
+    {
+      "id": "voxcpm-calm-man",
+      "language": "*",
+      "display_name": "Calm man"
+    },
+    {
+      "id": "voxcpm-young-man",
+      "language": "*",
+      "display_name": "Energetic young man"
+    },
+    {
+      "id": "voxcpm-older-man",
+      "language": "*",
+      "display_name": "Gravelly older man"
+    },
+    {
+      "id": "voxcpm-narrator",
+      "language": "*",
+      "display_name": "Narrator"
+    },
+    {
+      "id": "voxcpm-described",
+      "language": "*",
+      "display_name": "Voice you describe (in Configure)"
+    }
+  ],
+  "models": [
+    {
+      "id": "voxcpm2",
+      "display_name": "VoxCPM2 (2.4B)",
+      "repo": "openbmb/VoxCPM2",
+      "revision": "32279effe8c19989596f05d353d1447f51d9e915",
+      "size_mb": 4731,
+      "license": "Apache-2.0",
+      "bundled": false,
+      "default": true
+    }
+  ],
+  "disk_required_mb": 5600,
+  "ram_required_mb": 7168,
+  "gpu": "optional",
+  "config_schema": {
+    "fields": [
+      {
+        "key": "device",
+        "type": "select",
+        "label": "Inference device",
+        "default": "auto",
+        "options": [
+          {
+            "value": "auto",
+            "label": "Automatic (the Apple GPU on Apple Silicon, else the CPU)"
+          },
+          {
+            "value": "cpu",
+            "label": "CPU"
+          },
+          {
+            "value": "mps",
+            "label": "Apple GPU (MPS)"
+          }
+        ],
+        "help": "This build runs on the CPU, or on the GPU of an Apple Silicon Mac. It does not use NVIDIA GPUs."
+      },
+      {
+        "key": "precision",
+        "type": "select",
+        "label": "Weight precision",
+        "default": "auto",
+        "options": [
+          {
+            "value": "auto",
+            "label": "Automatic: bfloat16, with the diffusion in float32 on a CPU (about 7 GB of memory)"
+          },
+          {
+            "value": "bfloat16",
+            "label": "bfloat16 throughout: about 6 GB, but fast only on CPUs with native bfloat16"
+          },
+          {
+            "value": "float32",
+            "label": "float32: about 11 GB of memory, a little faster"
+          }
+        ]
+      },
+      {
+        "key": "steps",
+        "type": "int",
+        "label": "Quality steps",
+        "default": 10,
+        "min": 4,
+        "max": 30,
+        "step": 1,
+        "help": "Diffusion steps for each moment of speech. 10 is VoxCPM's default; 5 is about a quarter faster, with audibly less clarity."
+      },
+      {
+        "key": "cfg",
+        "type": "number",
+        "label": "Guidance",
+        "default": 2.0,
+        "min": 1.0,
+        "max": 4.0,
+        "step": 0.1,
+        "help": "How closely the speech follows the text and the voice. VoxCPM's default is 2.0."
+      },
+      {
+        "key": "threads",
+        "type": "int",
+        "label": "CPU threads",
+        "default": 0,
+        "min": 0,
+        "max": 256,
+        "step": 1,
+        "help": "0 picks the performance cores on a CPU that also has efficiency cores, else one thread per core. Fewer leaves the computer more responsive while dubbing."
+      },
+      {
+        "key": "voice_description",
+        "type": "string",
+        "label": "Voice description",
+        "help": "For the voice 'Voice you describe': who speaks and how, in a few words, for example 'An elderly woman, soft and warm voice, slow pace'. English works for every language."
+      },
+      {
+        "key": "voice_ref_audio",
+        "type": "file",
+        "label": "Fallback reference clip",
+        "help": "Used by the speaker's own voice when Subtitld has no clip of the speaker to send: 3 to 15 seconds of one person speaking, WAV preferred."
+      },
+      {
+        "key": "voice_ref_text",
+        "type": "string",
+        "label": "Fallback reference transcript",
+        "help": "The exact words spoken in the fallback clip. With them the clone is closer to the speaker."
+      },
+      {
+        "key": "skip_ref_text",
+        "type": "bool",
+        "default": false,
+        "label": "Clone the timbre only",
+        "help": "Subtitld normally sends, with the speaker's clip, the subtitle text spoken in it, and VoxCPM2 then continues from the clip, which comes closest to the speaker. With this on, only the timbre is cloned. Try it if a dub into another language keeps the speaker's accent, or when the subtitles paraphrase the speech."
+      }
+    ]
+  }
+}
