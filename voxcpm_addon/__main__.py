@@ -54,7 +54,7 @@ import wave
 from pathlib import Path
 
 from voxcpm_addon import ADDON_ID, PROTOCOL_VERSION, __version__
-from voxcpm_addon import engine, voices
+from voxcpm_addon import audio, engine, voices
 
 ADDON_VERSION = __version__
 
@@ -176,10 +176,8 @@ def _options() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# ffmpeg, for references in formats the model's reader does not take
+# ffmpeg, for references that are not PCM WAV (see audio.py)
 # ---------------------------------------------------------------------------
-_DIRECT_AUDIO = ('.wav', '.flac')
-
 
 def _find_ffmpeg() -> str | None:
     for candidate in (_env('SUBTITLD_FFMPEG_EXECUTABLE'), _env('FFMPEG_EXECUTABLE')):
@@ -218,13 +216,19 @@ def _child_env() -> dict | None:
 
 
 def _readable_reference(path: str, scratch: Path) -> str:
-    """`path` itself if the model reads it, else a 16 kHz WAV of it made by ffmpeg."""
-    if Path(path).suffix.lower() in _DIRECT_AUDIO:
+    """`path` itself if it is PCM WAV, else a 16 kHz WAV of it made by ffmpeg.
+
+    Subtitld's own clips are 16 kHz mono PCM WAV, read as they are.
+    """
+    try:
+        audio.read_wav(path)
         return path
+    except audio.UnreadableAudio:
+        pass
     ffmpeg = _find_ffmpeg()
     if not ffmpeg:
         raise _AddonError(ERR_BAD_PARAMS,
-                          f'The reference {Path(path).name} is not WAV or FLAC, and no ffmpeg was '
+                          f'The reference {Path(path).name} is not PCM WAV, and no ffmpeg was '
                           f'found to convert it. Use a WAV file.')
     out = scratch / 'reference.wav'
     cmd = [ffmpeg, '-nostdin', '-hide_banner', '-loglevel', 'error', '-y', '-i', path,
@@ -595,10 +599,11 @@ def _self_test() -> int:
     """Exercise what the frozen bundle needs to synthesize, without the weights.
 
     Imports the whole inference stack and runs the reference-audio path
-    (librosa's load, resampling and trim, which JIT-compiles through numba),
-    so a module left out of the bundle fails the build instead of the user's
-    first line.
+    (reading, resampling and trimming a clip, as VoxCPM2 does through what it
+    takes for librosa), so a module left out of the bundle fails the build
+    instead of the user's first line.
     """
+    engine.without_librosa()
     import numpy as np
     import torch
     from voxcpm.model import voxcpm2 as v2
@@ -611,8 +616,8 @@ def _self_test() -> int:
         clip = Path(tmp) / 'tone.wav'
         tone = 0.3 * np.sin(2 * np.pi * 220 * np.arange(44100) / 44100)
         _write_wav(clip, np.concatenate([np.zeros(4410), tone, np.zeros(4410)]), 44100)
-        audio, _sr = v2.librosa.load(str(clip), sr=16000, mono=True)
-        trimmed = v2._trim_audio_silence_vad(torch.from_numpy(audio).unsqueeze(0), 16000)
+        samples, _sr = v2.librosa.load(str(clip), sr=16000, mono=True)
+        trimmed = v2._trim_audio_silence_vad(torch.from_numpy(samples).unsqueeze(0), 16000)
     with torch.device('meta'):
         AudioVAEV2()
     report = {

@@ -15,7 +15,8 @@ requires-python = ">=3.10,<3.13"
 # What VoxCPM's inference path imports. `voxcpm` itself is installed with
 # --no-deps (see README): its own requirements add gradio, funasr, modelscope,
 # datasets and matplotlib for the web demo, training and denoising, none of
-# which synthesis touches. Versions are pinned in constraints.txt.
+# which synthesis touches; and librosa, whose two functions VoxCPM2 uses
+# voxcpm_addon/audio.py provides. Versions are pinned in constraints.txt.
 dependencies = [
     "torch>=2.5",
     "torchaudio>=2.5",
@@ -26,8 +27,6 @@ dependencies = [
     "einops",
     "pydantic>=2",
     "tqdm",
-    "librosa",
-    "soundfile",
     "numpy",
     "certifi",
 ]

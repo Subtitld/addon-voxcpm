@@ -13,4 +13,3 @@ release-staging/
 .DS_Store
 report.xml
 frozen-report.xml
-dist-linux/

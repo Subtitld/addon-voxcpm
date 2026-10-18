@@ -27,7 +27,7 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy
 SPEC_ROOT = Path(SPECPATH).resolve()
 
 REQUIRED = ('torch', 'torchaudio', 'voxcpm', 'transformers', 'tokenizers', 'safetensors',
-            'librosa', 'soundfile', 'soxr', 'numba', 'einops', 'pydantic', 'certifi')
+            'einops', 'pydantic', 'certifi')
 _missing = [name for name in REQUIRED if importlib.util.find_spec(name) is None]
 if _missing:
     raise SystemExit('pyinstaller.spec: not installed in the build env: ' + ', '.join(_missing))
@@ -39,17 +39,16 @@ hiddenimports = [name for name in collect_submodules('voxcpm')
 # which PyInstaller cannot follow. Take its core and the Llama model only.
 hiddenimports += collect_submodules(
     'transformers',
-    filter=lambda name: (not name.startswith('transformers.models.')
-                         or name.startswith('transformers.models.llama')),
+    filter=lambda name: ((not name.startswith('transformers.models.')
+                          or name.startswith('transformers.models.llama'))
+                         and 'testing_utils' not in name),
     on_error='ignore',
 )
 
-# librosa reads its lazy-loader stubs (.pyi) at import; transformers checks
-# its dependencies' versions through their metadata.
-datas = collect_data_files('librosa', includes=['**/*.pyi', '**/*.txt', '**/*.json', '**/*.csv'])
-datas += collect_data_files('voxcpm')
+# transformers checks its dependencies' versions through their metadata.
+datas = collect_data_files('voxcpm')
 datas += copy_metadata('transformers', recursive=True)
-for name in ('torch', 'torchaudio', 'voxcpm', 'safetensors', 'tokenizers', 'librosa', 'numba'):
+for name in ('torch', 'torchaudio', 'voxcpm', 'safetensors', 'tokenizers'):
     datas += copy_metadata(name)
 
 
@@ -112,16 +111,28 @@ a = Analysis(
         # VoxCPM's demo, denoiser, training and text normaliser, and what
         # only they import. The add-on never calls them.
         'gradio', 'spaces', 'modelscope', 'funasr', 'datasets', 'wetext', 'argbind',
+        # librosa and what it brings: VoxCPM2 gets voxcpm_addon.audio in its
+        # place. Left out even when installed, so none of it (nor soundfile's
+        # and soxr's LGPL libraries) can slip back into the bundle.
+        'librosa', 'soundfile', 'soxr', 'audioread', 'scipy', 'sklearn', 'numba', 'llvmlite',
+        'pooch', 'lazy_loader', 'joblib', 'threadpoolctl',
         'matplotlib', 'pandas', 'IPython', 'jupyter', 'notebook',
         'torch.utils.tensorboard', 'tensorboard', 'triton',
         'tensorflow', 'jax', 'flax', 'onnx', 'onnxruntime',
         'PySide6', 'PyQt6', 'PyQt5', 'tkinter', 'Tkinter', '_tkinter',
-        'pytest', 'setuptools', 'pkg_resources',
+        'pytest', '_pytest', 'pluggy', 'iniconfig', 'setuptools', 'pkg_resources',
+        # GPL (readline) and ncurses: the standard modules that link them are
+        # for interactive terminals, which the add-on never has.
+        'readline', 'curses', '_curses', '_curses_panel',
     ],
     noarchive=False,
 )
 
 a.binaries = _fix_libexpat(a.binaries)
+# glibc's vector maths library, which PyTorch links, is part of every glibc
+# system and must come from it, like libc and libm (which PyInstaller already
+# leaves out): a copy from the build machine would also bring glibc's LGPL.
+a.binaries = [entry for entry in a.binaries if not os.path.basename(entry[0]).startswith('libmvec.so')]
 
 pyz = PYZ(a.pure, a.zipped_data)
 

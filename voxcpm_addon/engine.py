@@ -19,7 +19,8 @@ on PyTorch's `meta` device, without memory, and takes the checkpoint's tensors
 as they are: the peak is about the size of the weights. The only tensors the
 checkpoint does not hold, the rotary position tables, are rebuilt the way
 upstream builds them. Upstream's `optimize` (torch.compile) is CUDA-only and
-needs a compiler at run time, so it is not used.
+needs a compiler at run time, so it is not used. VoxCPM2 gets voxcpm_addon.audio
+in place of librosa (see there).
 """
 
 from __future__ import annotations
@@ -321,8 +322,15 @@ def _in_float32(module):
     return InFloat32(module)
 
 
+def without_librosa() -> None:
+    """Give VoxCPM2, which imports librosa for two functions, voxcpm_addon.audio instead."""
+    from voxcpm_addon import audio
+    sys.modules['librosa'] = audio
+
+
 def load(folder: Path, device: str, dtype: str, threads: int = 0,
          float32_head: bool = False) -> Loaded:
+    without_librosa()
     import torch
     from safetensors.torch import load_file
     from transformers import LlamaTokenizerFast

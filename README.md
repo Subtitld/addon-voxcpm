@@ -79,11 +79,26 @@ pyinstaller pyinstaller.spec --noconfirm
 dist/voxcpm-addon/voxcpm-addon --self-test
 ```
 
-`tools/build-linux.sh` makes the Linux archive in `ubuntu:22.04`, as the
-release workflow does. A tag `v<version>` matching `manifest.json` builds and
-publishes all three platforms.
+The release workflow builds, proves and publishes every platform on a tag
+`v<version>` matching `manifest.json`. To run its Linux build locally, as
+GitHub runs it, use [act](https://github.com/nektos/act):
+
+```bash
+act workflow_dispatch -W .github/workflows/release.yml --input targets=linux-x86_64 \
+  -P ubuntu-22.04=catthehacker/ubuntu:act-22.04 --artifact-server-path /tmp/artifacts
+```
+
+A manual run on GitHub can build only some platforms (`targets`).
+`tools/collect_licences.py` fails the build when a native file in the bundle has
+no notice. The Linux archive carries numpy's libquadmath (LGPL-2.1), so the
+release attaches its complete source, built by `tools/build_libquadmath_source.py`.
 
 ## How it runs the model
+
+VoxCPM2 imports librosa for two functions, reading a reference clip and
+trimming its silence. `voxcpm_addon/audio.py` provides them instead (librosa's
+trimming, checked against librosa), which keeps scipy, scikit-learn, numba,
+libsndfile and soxr, about 400 MB, out of the archive.
 
 Upstream's loader builds the 2.4B-parameter model in float32 before copying
 the checkpoint in, which peaks near 10 GB. This add-on builds it on PyTorch's
