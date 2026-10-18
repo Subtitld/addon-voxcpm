@@ -17,6 +17,11 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      targets:
+        description: 'Platforms to build, comma-separated (linux-x86_64, macos-arm64, windows-x86_64); empty for all. Tag pushes always build all.'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -57,29 +62,46 @@ jobs:
               sys.exit('FATAL: tests were skipped; the release would ship partly untested')
           PY
 
+  # The platforms to build. A manual run can build only some, to try a
+  # platform that cannot be built locally without paying for the others.
+  plan:
+    name: Plan
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - id: plan
+        env:
+          TARGETS: ${{ github.event_name == 'workflow_dispatch' && inputs.targets || '' }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          platforms = [
+              {'os': 'ubuntu-22.04', 'platform_label': 'linux-x86_64', 'exe_suffix': '',
+               'torch_index': 'https://download.pytorch.org/whl/cpu'},
+              # The catalog cannot tell Mac architectures apart: ship arm64, as
+              # the other add-ons do. PyPI's macOS torch is the CPU + MPS build.
+              {'os': 'macos-14', 'platform_label': 'macos-arm64', 'exe_suffix': '',
+               'torch_index': 'https://pypi.org/simple'},
+              {'os': 'windows-2022', 'platform_label': 'windows-x86_64', 'exe_suffix': '.exe',
+               'torch_index': 'https://download.pytorch.org/whl/cpu'},
+          ]
+          wanted = {t.strip() for t in os.environ['TARGETS'].split(',') if t.strip()}
+          unknown = wanted - {p['platform_label'] for p in platforms}
+          if unknown:
+              raise SystemExit(f'unknown targets: {sorted(unknown)}')
+          chosen = [p for p in platforms if not wanted or p['platform_label'] in wanted]
+          print('matrix=' + json.dumps({'include': chosen}))
+          PY
+
   build:
     name: Build ${{ matrix.platform_label }}
-    needs: test
+    needs: [test, plan]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-22.04
-            platform_label: linux-x86_64
-            exe_suffix: ''
-            torch_index: https://download.pytorch.org/whl/cpu
-          # The catalog cannot tell Mac architectures apart: ship arm64, as the
-          # other add-ons do. PyPI's macOS torch is the CPU + MPS build.
-          - os: macos-14
-            platform_label: macos-arm64
-            exe_suffix: ''
-            torch_index: https://pypi.org/simple
-          - os: windows-2022
-            platform_label: windows-x86_64
-            exe_suffix: '.exe'
-            torch_index: https://download.pytorch.org/whl/cpu
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
 
     steps:
       - uses: actions/checkout@v4
