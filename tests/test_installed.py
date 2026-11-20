@@ -4,11 +4,12 @@ Copyright 2026 Subtitld contributors
 SPDX-License-Identifier: Apache-2.0
 
 $VOXCPM_TEST_BINARY names the binary; without it these tests skip. The
-release workflow sets it on every platform. The weights are 4.96 GB, too
-big for CI, so CI proves the bundle with --self-test (the whole inference
-stack imported, the reference-audio path run) and the protocol. The tests
-marked `weights` also synthesize and cancel for real; they run when
-$VOXCPM_TEST_MODELS_DIR holds the weights (as $SUBTITLD_MODELS_DIR would):
+release workflow sets it on every platform. CI proves the bundle with
+--self-test (audio.cpp loaded with VoxCPM2 in it, a clip read and written)
+and the protocol. The tests marked `weights` also synthesize and cancel for
+real; they run when $VOXCPM_TEST_MODELS_DIR holds the model (as
+$SUBTITLD_MODELS_DIR would, voxcpm/VoxCPM2-GGUF/ inside), and download it,
+2.96 GB, when it does not:
 
     VOXCPM_TEST_BINARY=... VOXCPM_TEST_MODELS_DIR=~/.cache/subtitld/models pytest tests/test_installed.py
 """
@@ -77,11 +78,12 @@ def test_version():
     assert out.returncode == 0 and out.stdout.startswith('voxcpm-addon ')
 
 
-def test_self_test_runs_the_inference_stack():
+def test_self_test_loads_audiocpp():
     out = subprocess.run([BINARY, '--self-test'], capture_output=True, text=True, timeout=300)
     assert out.returncode == 0, out.stderr[-2000:]
     report = json.loads(out.stdout.strip().splitlines()[-1])
-    assert report['ok'] is True and report['samples'] > 0
+    assert report['ok'] is True and report['frames'] == 16000
+    assert 'voxcpm2' in report['families'] and report['runtime'].startswith('audio.cpp ')
 
 
 def test_handshake_and_refusals(tmp_path):

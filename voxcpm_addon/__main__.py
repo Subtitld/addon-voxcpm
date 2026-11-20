@@ -13,10 +13,10 @@ KIND, either express or implied.
 What this add-on is
 -------------------
 Text-to-speech with OpenBMB's VoxCPM2 (Apache-2.0), in 30 languages, at
-48 kHz. Serves `tts.synthesize`. A line is spoken in the speaker's own voice,
-cloned from the video, or in a voice made from a description (see voices.py).
-The model, 4.96 GB, downloads on the first synthesis (see engine.py); after
-that nothing leaves the machine.
+48 kHz, run by audio.cpp. Serves `tts.synthesize`. A line is spoken in the
+speaker's own voice, cloned from the video, or in a voice made from a
+description (see voices.py). The model, 2.96 GB, downloads on the first
+synthesis (see engine.py); after that nothing leaves the machine.
 
 Wire format
 -----------
@@ -25,14 +25,13 @@ the host prefixes with `[addon:voxcpm]` and surfaces.
 
 Options (the host sets them from Configure as VOXCPM_<KEY>)
 -----------------------------------------------------------
-device, precision, steps, cfg, threads; voice_description for the described
-voice; voice_ref_audio and voice_ref_text, a clone reference to fall back on
+steps, cfg, threads; voice_description for the described voice; voice_ref_audio and voice_ref_text, a clone reference to fall back on
 when the host sends none.
 
 Limits
 ------
-One synthesis at a time: the model holds a single KV cache. A cancel stops a
-line between two decoding steps, or stops the download (which resumes on the
+One synthesis at a time: the session holds a single KV cache. A cancel stops
+a line between two decoding steps, or stops the download (which resumes on the
 next request).
 """
 
@@ -50,11 +49,10 @@ import tempfile
 import threading
 import time
 import traceback
-import wave
 from pathlib import Path
 
 from voxcpm_addon import ADDON_ID, PROTOCOL_VERSION, __version__
-from voxcpm_addon import audio, engine, voices
+from voxcpm_addon import audio, engine, tls, voices
 
 ADDON_VERSION = __version__
 
@@ -81,8 +79,8 @@ _proto_lock = threading.Lock()
 def _claim_protocol_stdio() -> None:
     """Give the protocol exclusive use of the real stdin/stdout.
 
-    fd-level, not just `sys.stdout = sys.stderr`: native code (PyTorch, its
-    OpenMP runtime) may write to fd 1 directly. Falls back to the
+    fd-level, not just `sys.stdout = sys.stderr`: native code (audio.cpp,
+    ggml) may write to fd 1 directly. Falls back to the
     Python-level swap if the fd dance fails.
     """
     global _PROTO_IN, _PROTO_OUT
@@ -164,8 +162,6 @@ def _env_number(name: str, default: float, low: float, high: float) -> float:
 
 def _options() -> dict:
     return {
-        'device': _env('VOXCPM_DEVICE') or 'auto',
-        'precision': _env('VOXCPM_PRECISION') or 'auto',
         'steps': int(_env_number('VOXCPM_STEPS', 10, 4, 30)),
         'cfg': _env_number('VOXCPM_CFG', 2.0, 1.0, 4.0),
         'threads': int(_env_number('VOXCPM_THREADS', 0, 0, 256)),
@@ -218,7 +214,7 @@ def _child_env() -> dict | None:
 def _readable_reference(path: str, scratch: Path) -> str:
     """`path` itself if it is PCM WAV, else a 16 kHz WAV of it made by ffmpeg.
 
-    Subtitld's own clips are 16 kHz mono PCM WAV, read as they are.
+    Subtitld's own clips are 16 kHz mono 16-bit WAV, read as they are.
     """
     try:
         audio.read_wav(path)
@@ -279,22 +275,16 @@ def _load_model(state: '_Request', options: dict) -> engine.Loaded:
                                   f'Out of disk space downloading VoxCPM2 to {folder} '
                                   f'(it needs {engine.MODEL_BYTES / 1e9:.1f} GB).') from exc
             raise
+    for path in engine.retire_torch_weights():
+        log.info('removed %s, which earlier versions of the add-on downloaded', path)
     _emit_progress(state.req_id, 0.2, 'Loading VoxCPM2...')
-    try:
-        device = engine.resolve_device(options['device'])
-        dtype, float32_head = engine.resolve_precision(options['precision'], device)
-    except Exception as exc:  # noqa: BLE001 — torch failing to import is reported, not raised
-        raise _AddonError(ERR_INTERNAL, f'PyTorch is not usable: {exc}') from exc
     started = time.monotonic()
     try:
-        _loaded = engine.load(folder, device, dtype, options['threads'], float32_head)
-    except (ValueError, RuntimeError) as exc:
-        if 'not available' in str(exc).lower():  # a device this build cannot use
-            raise _AddonError(ERR_BAD_PARAMS, f'{exc}. Set Inference device to Automatic.') from exc
-        raise
-    log.info('VoxCPM2 loaded in %.1fs on %s (%s%s), %d Hz', time.monotonic() - started,
-             _loaded.device, _loaded.dtype, ', diffusion in float32' if float32_head else '',
-             _loaded.sample_rate)
+        _loaded = engine.load(folder / engine.MODEL_FILE, options['threads'])
+    except engine.EngineError as exc:
+        raise _AddonError(ERR_INTERNAL, f'VoxCPM2 could not be loaded: {exc}') from exc
+    log.info('VoxCPM2 loaded in %.1fs, %d threads%s', time.monotonic() - started, _loaded.threads,
+             f' on CPUs {_loaded.cpus[0]}-{_loaded.cpus[-1]} (the performance cores)' if _loaded.cpus else '')
     return _loaded
 
 
@@ -313,11 +303,9 @@ def _anchor(state: '_Request', loaded: engine.Loaded, description: str, seed: in
         folder.mkdir(parents=True, exist_ok=True)
         _emit_progress(state.req_id, 0.25, 'Making the voice...')
         log.info('anchor %s: %r in %s, seed %d', key, description, language, seed)
-        wav = engine.synthesize(loaded, f'({description}){sentence}', cfg_value=options['cfg'],
-                                steps=options['steps'], seed=seed, on_step=state.check)
-        partial = clip.with_suffix('.part')
-        _write_wav(partial, wav, loaded.sample_rate)
-        os.replace(partial, clip)
+        samples, rate = engine.synthesize(loaded, f'({description}){sentence}', cfg_value=options['cfg'],
+                                          steps=options['steps'], seed=seed, on_step=state.check)
+        audio.write_wav(clip, samples, rate)
     return str(clip), sentence, native
 
 
@@ -337,20 +325,6 @@ class _Request:
 
 _active: dict[str, _Request] = {}
 _active_lock = threading.Lock()
-
-
-def _write_wav(path: Path, wav, sample_rate: int) -> float:
-    """16-bit mono WAV, which the host's dubbing pipeline expects. Returns seconds."""
-    import numpy as np
-    samples = np.clip(np.asarray(wav, dtype=np.float32).reshape(-1), -1.0, 1.0)
-    pcm = (samples * 32767.0).round().astype('<i2')
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with wave.open(str(path), 'wb') as out:
-        out.setnchannels(1)
-        out.setsampwidth(2)
-        out.setframerate(int(sample_rate))
-        out.writeframes(pcm.tobytes())
-    return len(samples) / float(sample_rate)
 
 
 def _seed(params: dict) -> int:
@@ -415,39 +389,39 @@ def _handle_synthesize(state: _Request, params: dict) -> None:
             if voice.id == voices.CLONE:
                 clip = _readable_reference(reference, scratch)
                 mode = 'continuation' if transcript else 'reference'
-                kwargs = {'reference_wav': clip}
-                if transcript:
-                    kwargs.update(prompt_wav=clip, prompt_text=transcript)
+                kwargs = {'reference': clip, 'reference_text': transcript or None}
             else:
                 clip, sentence, native = _anchor(state, loaded, description, seed,
                                                  str(params.get('language') or ''), options)
                 mode = 'anchor-continuation' if native else 'anchor-reference'
-                kwargs = {'reference_wav': clip}
-                if native:
-                    kwargs.update(prompt_wav=clip, prompt_text=sentence)
+                kwargs = {'reference': clip, 'reference_text': sentence if native else None}
 
             # Progress: 0.3 -> 0.95 against the line's expected length, about
             # 14 characters a second of speech.
+            # A retried take counts its steps from 0 again; the bar does not go back.
             expected = max(4.0, len(text) / 14.0 * engine.STEPS_PER_SECOND)
+            shown = [0.3]
 
             def on_step(index: int) -> None:
                 state.check()
-                if index % 4 == 0:
-                    _emit_progress(req_id, 0.3 + 0.65 * min(1.0, index / expected), 'Speaking...')
+                value = 0.3 + 0.65 * min(1.0, index / expected)
+                if index % 4 == 0 and value > shown[0]:
+                    shown[0] = value
+                    _emit_progress(req_id, value, 'Speaking...')
 
             log.info('synthesize %s: voice=%s mode=%s seed=%d steps=%d chars=%d',
                      req_id, voice.id, mode, seed, options['steps'], len(text))
             started = time.monotonic()
-            wav = engine.synthesize(loaded, text, cfg_value=options['cfg'], steps=options['steps'],
-                                    seed=seed, on_step=on_step, **kwargs)
+            samples, rate = engine.synthesize(loaded, text, cfg_value=options['cfg'], steps=options['steps'],
+                                              seed=seed, on_step=on_step, **kwargs)
             took = time.monotonic() - started
         state.check()
-        duration = _write_wav(Path(output_path), wav, loaded.sample_rate)
+        duration = audio.write_wav(Path(output_path), samples, rate)
         log.info('synthesize %s: %.2fs of audio in %.1fs', req_id, duration, took)
         outcome = ('result', {
             'path': output_path,
             'duration_sec': round(duration, 3),
-            'sample_rate': loaded.sample_rate,
+            'sample_rate': rate,
             'channels': 1,
             'voice': voice.id,
         })
@@ -458,7 +432,7 @@ def _handle_synthesize(state: _Request, params: dict) -> None:
         log.warning('synthesize %s failed: [%s] %s', req_id, exc.code, exc.message)
         outcome = ('error', exc.code, exc.message, exc.retryable)
     except MemoryError:
-        outcome = ('error', ERR_OOM, 'Out of memory. VoxCPM2 needs about 6 GB free.', False)
+        outcome = ('error', ERR_OOM, 'Out of memory. VoxCPM2 needs about 4.5 GB free.', False)
     except Exception as exc:  # noqa: BLE001 — every path must end in one terminal frame
         log.exception('synthesize %s failed', req_id)
         if 'out of memory' in str(exc).lower():
@@ -596,37 +570,34 @@ def _stop_workers(budget_sec: float = 3.5) -> bool:
 
 
 def _self_test() -> int:
-    """Exercise what the frozen bundle needs to synthesize, without the weights.
+    """Exercise what the frozen bundle needs to synthesize, without the model.
 
-    Imports the whole inference stack and runs the reference-audio path
-    (reading, resampling and trimming a clip, as VoxCPM2 does through what it
-    takes for librosa), so a module left out of the bundle fails the build
-    instead of the user's first line.
+    Loads audio.cpp and finds VoxCPM2 in it, reads and writes a clip, and
+    makes the TLS context the download uses, so a library or module left out
+    of the bundle fails the build instead of the user's first line.
     """
-    engine.without_librosa()
-    import numpy as np
-    import torch
-    from voxcpm.model import voxcpm2 as v2
-    from voxcpm.modules.audiovae import AudioVAEV2
-    from voxcpm.modules.minicpm4.model import MiniCPMLongRoPE  # noqa: F401
-    from safetensors.torch import load_file  # noqa: F401
-    from transformers import LlamaTokenizerFast  # noqa: F401
+    import math
+    import ssl
+    from array import array
 
+    families = engine.families()
+    if 'voxcpm2' not in families:
+        raise SystemExit(f'audio.cpp has no voxcpm2 family, only {families}')
     with tempfile.TemporaryDirectory() as tmp:
         clip = Path(tmp) / 'tone.wav'
-        tone = 0.3 * np.sin(2 * np.pi * 220 * np.arange(44100) / 44100)
-        _write_wav(clip, np.concatenate([np.zeros(4410), tone, np.zeros(4410)]), 44100)
-        samples, _sr = v2.librosa.load(str(clip), sr=16000, mono=True)
-        trimmed = v2._trim_audio_silence_vad(torch.from_numpy(samples).unsqueeze(0), 16000)
-    with torch.device('meta'):
-        AudioVAEV2()
+        audio.write_wav(clip, array('f', (0.3 * math.sin(2 * math.pi * 220 * i / 16000) for i in range(16000))),
+                        16000)
+        frames = audio.read_wav(clip).frames
+    engine._ssl_context()
     report = {
         'ok': True,
         'version': ADDON_VERSION,
-        'torch': torch.__version__,
-        'threads': torch.get_num_threads(),
-        'samples': int(trimmed.shape[-1]),
-        'device': engine.resolve_device('auto'),
+        'runtime': engine.runtime_version(),
+        'families': families,
+        'threads': engine.default_threads(),
+        'performance_cpus': engine.performance_cpus(),
+        'frames': frames,
+        'openssl': ssl.OPENSSL_VERSION,
     }
     print(json.dumps(report), file=sys.__stdout__, flush=True)
     return 0
@@ -641,6 +612,7 @@ def main() -> int:
         format='%(asctime)s %(levelname)s %(name)s: %(message)s',
         stream=sys.stderr,
     )
+    tls.configure_ca_bundle()
     if '--self-test' in sys.argv[1:]:
         return _self_test()
     _claim_protocol_stdio()
@@ -659,8 +631,8 @@ def main() -> int:
     finally:
         stopped = _stop_workers()
     if not stopped:
-        # A worker is still inside a decoding step. Normal teardown would free
-        # tensors under it, so leave without teardown.
+        # A worker is still inside audio.cpp (a step, or loading the model).
+        # Normal teardown could free what it is using, so leave without it.
         log.warning('a synthesis is still running; exiting without cleanup')
         try:
             sys.stderr.flush()

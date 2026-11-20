@@ -78,14 +78,12 @@ def test_the_model_entry_is_the_pinned_revision():
     assert MANIFEST['disk_required_mb'] > model['size_mb']
 
 
-def test_precision_choices():
-    assert engine.resolve_precision('auto', 'cpu') == ('bfloat16', True)
-    assert engine.resolve_precision('bfloat16', 'cpu') == ('bfloat16', False)
-    assert engine.resolve_precision('float32', 'cpu') == ('float32', False)
-    assert engine.resolve_precision('auto', 'mps') == ('float32', False)
-    assert engine.resolve_precision('bfloat16', 'mps') == ('float32', False)
-    assert {o['value'] for o in FIELDS['precision']['options']} == {'auto', 'bfloat16', 'float32'}
-
-
 def test_cpu_lists_parse():
     assert engine._cpu_list('0-3,8,10-11\n') == [0, 1, 2, 3, 8, 10, 11]
+
+
+def test_the_settings_are_the_ones_this_runtime_has():
+    # Device and precision went with PyTorch: audio.cpp runs the Q8 model on the CPU.
+    assert 'device' not in FIELDS and 'precision' not in FIELDS
+    assert MANIFEST['compute'] == 'cpu'
+    assert MANIFEST['ram_required_mb'] >= 4500

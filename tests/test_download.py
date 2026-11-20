@@ -1,4 +1,4 @@
-"""The weights download: pinned files, resumed after an interruption, refused when they do not check out.
+"""The model download: pinned files, resumed after an interruption, refused when they do not check out.
 
 Copyright 2026 Subtitld contributors
 SPDX-License-Identifier: Apache-2.0
@@ -14,7 +14,13 @@ import pytest
 
 from voxcpm_addon import engine
 
-FILES = {'config.json': b'{"architecture": "voxcpm2"}', 'model.safetensors': bytes(range(256)) * 400}
+# Paths in the repository, as MODEL_FILES gives them; each is saved under its file name.
+SMALL, BIG = 'VoxCPM2-GGUF/small.bin', 'VoxCPM2-GGUF/model.gguf'
+FILES = {SMALL: b'{"architecture": "voxcpm2"}', BIG: bytes(range(256)) * 400}
+
+
+def _name(path: str) -> str:
+    return path.rsplit('/', 1)[-1]
 
 
 class _Hub(BaseHTTPRequestHandler):
@@ -23,10 +29,11 @@ class _Hub(BaseHTTPRequestHandler):
     requests: list[tuple[str, str | None]] = []
 
     def do_GET(self):  # noqa: N802
-        name = self.path.rsplit('/', 1)[-1]
-        data = self.served.get(name)
-        self.requests.append((name, self.headers.get('Range')))
-        if data is None or f'/resolve/{engine.MODEL_REVISION}/' not in self.path:
+        prefix = f'/{engine.MODEL_REPO}/resolve/{engine.MODEL_REVISION}/'
+        path = self.path[len(prefix):] if self.path.startswith(prefix) else None
+        data = self.served.get(path)
+        self.requests.append((path, self.headers.get('Range')))
+        if data is None:
             self.send_error(404)
             return
         start = 0
@@ -57,7 +64,7 @@ def hub(monkeypatch, tmp_path):
     monkeypatch.delenv('VOXCPM_MODEL_DIR', raising=False)
     monkeypatch.setattr(engine, 'MODEL_FILES', tuple(
         (name, len(data), hashlib.sha256(data).hexdigest()) for name, data in FILES.items()))
-    yield tmp_path / 'VoxCPM2'
+    yield tmp_path / 'VoxCPM2-GGUF'
     server.shutdown()
 
 
@@ -69,7 +76,7 @@ def test_downloads_every_file_and_remembers_it_checked_out(hub):
     seen = []
     engine.ensure_weights(hub, lambda done, total: seen.append((done, total)), _never)
     for name, data in FILES.items():
-        assert (hub / name).read_bytes() == data
+        assert (hub / _name(name)).read_bytes() == data
     assert engine.weights_present(hub)
     total = sum(len(d) for d in FILES.values())
     assert seen[-1] == (total, total)
@@ -82,33 +89,33 @@ def test_downloads_every_file_and_remembers_it_checked_out(hub):
 
 def test_an_interrupted_download_resumes(hub):
     hub.mkdir(parents=True)
-    data = FILES['model.safetensors']
-    (hub / 'model.safetensors.part').write_bytes(data[:30000])
-    assert engine.missing_bytes(hub) == len(FILES['config.json']) + len(data) - 30000
+    data = FILES[BIG]
+    (hub / 'model.gguf.part').write_bytes(data[:30000])
+    assert engine.missing_bytes(hub) == len(FILES[SMALL]) + len(data) - 30000
     engine.ensure_weights(hub, lambda *a: None, _never)
-    assert (hub / 'model.safetensors').read_bytes() == data
-    assert ('model.safetensors', 'bytes=30000-') in _Hub.requests
+    assert (hub / 'model.gguf').read_bytes() == data
+    assert (BIG, 'bytes=30000-') in _Hub.requests
 
 
 def test_a_server_ignoring_the_range_still_gives_the_whole_file(hub):
     hub.mkdir(parents=True)
-    (hub / 'model.safetensors.part').write_bytes(FILES['model.safetensors'][:500])
+    (hub / 'model.gguf.part').write_bytes(FILES[BIG][:500])
     _Hub.ignore_range = True
     engine.ensure_weights(hub, lambda *a: None, _never)
-    assert (hub / 'model.safetensors').read_bytes() == FILES['model.safetensors']
+    assert (hub / 'model.gguf').read_bytes() == FILES[BIG]
 
 
 def test_a_file_that_does_not_match_its_sha256_is_discarded(hub):
-    _Hub.served['model.safetensors'] = bytes(len(FILES['model.safetensors']))
+    _Hub.served[BIG] = bytes(len(FILES[BIG]))
     with pytest.raises(engine.DownloadError, match='sha256'):
         engine.ensure_weights(hub, lambda *a: None, _never)
-    assert not (hub / 'model.safetensors').exists()
-    assert not (hub / 'model.safetensors.part').exists()
+    assert not (hub / 'model.gguf').exists()
+    assert not (hub / 'model.gguf.part').exists()
     assert not engine.weights_present(hub)
 
 
 def test_a_missing_file_on_the_server_is_an_error(hub):
-    del _Hub.served['config.json']
+    del _Hub.served[SMALL]
     with pytest.raises(engine.DownloadError, match='HTTP 404'):
         engine.ensure_weights(hub, lambda *a: None, _never)
 
@@ -131,11 +138,34 @@ def test_a_folder_given_by_the_user_is_used_as_it_is(monkeypatch, tmp_path):
     with pytest.raises(engine.DownloadError, match='lacks'):
         engine.ensure_weights(tmp_path, lambda *a: None, _never)
     for name, _size, _sha in engine.MODEL_FILES:
-        (tmp_path / name).write_bytes(b'x')
+        (tmp_path / _name(name)).write_bytes(b'x')
     assert engine.weights_present(tmp_path)
+    assert engine.retire_torch_weights() == []
 
 
-def test_the_weights_go_to_the_hosts_model_cache(monkeypatch, tmp_path):
+def test_the_model_goes_to_the_hosts_model_cache(monkeypatch, tmp_path):
     monkeypatch.delenv('VOXCPM_MODEL_DIR', raising=False)
     monkeypatch.setenv('SUBTITLD_MODELS_DIR', str(tmp_path))
-    assert engine.model_dir() == tmp_path / 'voxcpm' / 'VoxCPM2'
+    assert engine.model_dir() == tmp_path / 'voxcpm' / 'VoxCPM2-GGUF'
+    assert engine.MODEL_FILE == _name(engine.MODEL_FILES[0][0])
+
+
+def test_the_pytorch_weights_of_earlier_versions_are_removed(monkeypatch, tmp_path):
+    monkeypatch.delenv('VOXCPM_MODEL_DIR', raising=False)
+    monkeypatch.setenv('SUBTITLD_MODELS_DIR', str(tmp_path))
+    root = tmp_path / 'voxcpm'
+    old, anchors, new = root / 'VoxCPM2', root / 'anchors', root / 'VoxCPM2-GGUF'
+    for folder in (old, anchors, new):
+        folder.mkdir(parents=True)
+    (old / 'model.safetensors').write_bytes(b'x')
+    (anchors / 'abc.wav').write_bytes(b'x')
+    (new / 'voxcpm2-q8_0.gguf').write_bytes(b'x')
+
+    (old / '.verified').write_text('some other revision\n')
+    assert engine.retire_torch_weights() == []  # not ours: left alone
+    assert old.is_dir()
+
+    (old / '.verified').write_text(engine.TORCH_REVISION + '\n')
+    assert engine.retire_torch_weights() == [old, anchors]
+    assert not old.exists() and not anchors.exists() and new.is_dir()
+    assert engine.retire_torch_weights() == []

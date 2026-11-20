@@ -15,6 +15,12 @@ with only the VoxCPM2 family compiled in, and collects:
 - build/assets/native.json: where it all came from, and each file's SHA-256.
 - build/licences/audiocpp/: the licences of what the libraries compile in.
 
+One patch is applied first, tools/patches/audiocpp-step-callback.patch: a
+callback audio.cpp calls before each generated step, which reports progress
+and stops a line between two steps (upstream's offline run cannot be stopped,
+and its streaming run returns only when the line is done). The patch travels
+with the licences, as the record of what was changed.
+
 The model specs are compiled into the library (AUDIOCPP_DEPLOYMENT_BUILD), so
 no data files travel with it. ggml runs on its own thread pool, without
 OpenMP: as fast as with it on an i7-13700T, and no libgomp to ship.
@@ -42,6 +48,7 @@ RUNTIME = ASSETS / 'audiocpp'
 LICENCES = BUILD / 'licences' / 'audiocpp'
 SRC = BUILD / 'audiocpp-src'
 NATIVE_BUILD = BUILD / 'native'
+PATCHES = [ROOT / 'tools' / 'patches' / 'audiocpp-step-callback.patch']
 
 REPO = 'https://github.com/0xShug0/audio.cpp'
 VERSION = '0.9.5'
@@ -122,7 +129,7 @@ GIT = ['git', '-c', 'core.autocrlf=false', '-c', 'core.eol=lf']
 
 
 def checkout():
-    """The pinned commit, shallow. Its one submodule (web front ends) isn't needed."""
+    """The pinned commit, shallow, with PATCHES applied. Its one submodule (web front ends) isn't needed."""
     if not (SRC / '.git').exists():
         SRC.mkdir(parents=True, exist_ok=True)
         run([*GIT, 'init', '-q'], cwd=SRC)
@@ -130,7 +137,10 @@ def checkout():
     head = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=SRC, capture_output=True, text=True).stdout.strip()
     if head != COMMIT:
         run([*GIT, 'fetch', '-q', '--depth', '1', 'origin', COMMIT], cwd=SRC)
-        run([*GIT, 'checkout', '-q', '--force', COMMIT], cwd=SRC)
+    run([*GIT, 'checkout', '-q', '--force', COMMIT], cwd=SRC)
+    run([*GIT, 'clean', '-q', '-fd'], cwd=SRC)
+    for patch in PATCHES:
+        run([*GIT, 'apply', '--whitespace=nowarn', patch], cwd=SRC)
 
 
 def build(platform, jobs):
@@ -219,6 +229,8 @@ def check_vendored():
 def collect_licences(present):
     fresh(LICENCES)
     shutil.copyfile(SRC / 'LICENSE', LICENCES / 'LICENSE')
+    for patch in PATCHES:
+        shutil.copyfile(patch, LICENCES / patch.name)
     for name in present:
         folder = LICENCES / 'third_party' / name
         folder.mkdir(parents=True)
@@ -240,6 +252,7 @@ def main():
 
     files = {p.relative_to(ASSETS).as_posix(): sha256(p) for p in sorted(ASSETS.rglob('*')) if p.is_file()}
     record = {'runtime': f'audio.cpp {VERSION} C API, VoxCPM2 only', 'repo': REPO, 'commit': COMMIT,
+              'patches': {p.name: sha256(p) for p in PATCHES},
               'platform': host, 'entry': 'audiocpp/libaudiocpp.so.0', 'files': files}
     (ASSETS / 'native.json').write_text(json.dumps(record, indent=1) + '\n')
     size = sum(p.stat().st_size for p in RUNTIME.iterdir()) / 2**20

@@ -4,13 +4,14 @@
 Copyright 2026 Subtitld contributors
 SPDX-License-Identifier: Apache-2.0
 
-Produces `dist/voxcpm-addon/` (launcher + `_internal/`): CPU PyTorch, VoxCPM's
-inference code and what it imports. The weights are not in it; they download
-on the first synthesis. The release step copies the folder to `bin/` inside
-the archive, next to manifest.json.
+Produces `dist/voxcpm-addon/` (launcher + `_internal/`): the add-on's own
+code on CPython's standard library, and audio.cpp in `_internal/audiocpp/`.
+The model is not in it; it downloads on the first synthesis. The release step
+copies the folder to `bin/` inside the archive, next to manifest.json.
 
-Run from the add-on root, with the dependencies installed as the README says:
+Run from the add-on root:
 
+    python tools/build_native.py      # Linux: tools/build_native_linux.sh
     pyinstaller pyinstaller.spec --noconfirm
     dist/voxcpm-addon/voxcpm-addon --self-test
 """
@@ -19,47 +20,36 @@ Run from the add-on root, with the dependencies installed as the README says:
 
 from __future__ import annotations
 
-import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy_metadata
-
 SPEC_ROOT = Path(SPECPATH).resolve()
+ASSETS = SPEC_ROOT / 'build' / 'assets'
+PACKAGE = SPEC_ROOT / 'voxcpm_addon'
+_PLATFORM = {'win32': 'windows', 'darwin': 'macos'}.get(sys.platform, 'linux')
 
-REQUIRED = ('torch', 'torchaudio', 'voxcpm', 'transformers', 'tokenizers', 'safetensors',
-            'einops', 'pydantic', 'certifi')
-_missing = [name for name in REQUIRED if importlib.util.find_spec(name) is None]
-if _missing:
-    raise SystemExit('pyinstaller.spec: not installed in the build env: ' + ', '.join(_missing))
-
-# VoxCPM's inference modules, not its training, CLI or web demo.
-hiddenimports = [name for name in collect_submodules('voxcpm')
-                 if not name.startswith(('voxcpm.training', 'voxcpm.cli'))]
-# transformers resolves `LlamaTokenizerFast` through its lazy module table,
-# which PyInstaller cannot follow. Take its core and the Llama model only.
-hiddenimports += collect_submodules(
-    'transformers',
-    filter=lambda name: ((not name.startswith('transformers.models.')
-                          or name.startswith('transformers.models.llama'))
-                         and 'testing_utils' not in name),
-    on_error='ignore',
-)
-
-# transformers checks its dependencies' versions through their metadata.
-datas = collect_data_files('voxcpm')
-datas += copy_metadata('transformers', recursive=True)
-for name in ('torch', 'torchaudio', 'voxcpm', 'safetensors', 'tokenizers'):
-    datas += copy_metadata(name)
+# Fail the build, loudly, if the runtime is missing. Otherwise the frozen
+# add-on would answer the handshake and then fail the first request.
+try:
+    _NATIVE = json.loads((ASSETS / 'native.json').read_text(encoding='utf-8'))
+except OSError:
+    raise SystemExit(f'FATAL: no {ASSETS / "native.json"}. Run `python tools/build_native.py` first.')
+if _NATIVE['platform'] != _PLATFORM:
+    raise SystemExit(f'FATAL: build/assets holds the {_NATIVE["platform"]} runtime, not {_PLATFORM}\'s')
+_FILES = [*_NATIVE['files'], 'native.json']
+_MISSING = [name for name in _FILES if not (ASSETS / name).is_file()]
+if _MISSING:
+    raise SystemExit(f'FATAL: build/assets lacks {", ".join(_MISSING)}. Run `python tools/build_native.py` again.')
 
 
 # ---------------------------------------------------------------------------
 # libexpat sanity check (from addon-whispercpp): a stale expat on the build
 # host makes the frozen binary die before Python starts.
 # ---------------------------------------------------------------------------
-import os
-import subprocess
-import sys
-
 _EXPAT_SYMBOL = 'XML_SetReparseDeferralEnabled'
 
 
@@ -95,44 +85,36 @@ def _fix_libexpat(entries):
 
 
 a = Analysis(
-    [str(SPEC_ROOT / 'voxcpm_addon' / '__main__.py')],
+    [str(PACKAGE / '__main__.py')],
     pathex=[str(SPEC_ROOT)],
     binaries=[],
-    datas=datas,
-    hiddenimports=hiddenimports,
+    datas=[],
+    hiddenimports=[],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    # VoxCPM's audio VAE compiles a function with torch.jit.script when it is
-    # imported, and TorchScript reads the function's source: ship voxcpm's .py
-    # files next to the compiled ones.
-    module_collection_mode={'voxcpm': 'pyz+py'},
     excludes=[
-        # VoxCPM's demo, denoiser, training and text normaliser, and what
-        # only they import. The add-on never calls them.
-        'gradio', 'spaces', 'modelscope', 'funasr', 'datasets', 'wetext', 'argbind',
-        # librosa and what it brings: VoxCPM2 gets voxcpm_addon.audio in its
-        # place. Left out even when installed, so none of it (nor soundfile's
-        # and soxr's LGPL libraries) can slip back into the bundle.
-        'librosa', 'soundfile', 'soxr', 'audioread', 'scipy', 'sklearn', 'numba', 'llvmlite',
-        'pooch', 'lazy_loader', 'joblib', 'threadpoolctl',
-        'matplotlib', 'pandas', 'IPython', 'jupyter', 'notebook',
-        'torch.utils.tensorboard', 'tensorboard', 'triton',
-        'tensorflow', 'jax', 'flax', 'onnx', 'onnxruntime',
         'PySide6', 'PyQt6', 'PyQt5', 'tkinter', 'Tkinter', '_tkinter',
-        'pytest', '_pytest', 'pluggy', 'iniconfig', 'setuptools', 'pkg_resources',
-        # GPL (readline) and ncurses: the standard modules that link them are
-        # for interactive terminals, which the add-on never has.
+        'numpy', 'torch', 'torchaudio', 'onnxruntime', 'setuptools', 'pkg_resources', 'unittest', 'pydoc_data',
+        'pytest', 'huggingface_hub', 'requests', 'urllib3', 'certifi',
+        # Standard modules the add-on never calls, reached only through
+        # optional imports (shutil's archive formats, random's hash fallback,
+        # uuid). Each would bring a native library, and with it a licence to
+        # ship: bzip2, xz, zstd, libmpdec, libuuid, SQLite. ssl and hashlib
+        # stay: the model downloads over HTTPS and is checked by sha256, so
+        # OpenSSL ships. tests/test_installed.py runs the frozen binary end to
+        # end, so a module that turns out to be needed fails the release
+        # build, not the user.
+        'bz2', '_bz2', 'lzma', '_lzma', 'compression', '_zstd',
+        'decimal', '_decimal', '_pydecimal', '_uuid', 'sqlite3', '_sqlite3',
+        # GPL (readline) and ncurses: for interactive terminals, which the
+        # add-on never has.
         'readline', 'curses', '_curses', '_curses_panel',
     ],
     noarchive=False,
 )
 
 a.binaries = _fix_libexpat(a.binaries)
-# glibc's vector maths library, which PyTorch links, is part of every glibc
-# system and must come from it, like libc and libm (which PyInstaller already
-# leaves out): a copy from the build machine would also bring glibc's LGPL.
-a.binaries = [entry for entry in a.binaries if not os.path.basename(entry[0]).startswith('libmvec.so')]
 
 pyz = PYZ(a.pure, a.zipped_data)
 
@@ -166,3 +148,16 @@ coll = COLLECT(
     upx_exclude=[],
     name='voxcpm-addon',
 )
+
+# audio.cpp is loaded by the add-on with ctypes from a path it knows, so it is
+# copied in after COLLECT rather than handed to PyInstaller. Given to
+# PyInstaller, even as data, the libraries are reclassified as binaries, their
+# dependencies are collected beside them and on macOS they are re-signed.
+# Copied here, they stay byte for byte as built, each finding the others in
+# its own folder.
+_out = Path(DISTPATH) / 'voxcpm-addon' / '_internal'
+if (_out / 'audiocpp').exists():
+    shutil.rmtree(_out / 'audiocpp')
+for _name in _FILES:
+    (_out / _name).parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(ASSETS / _name, _out / _name)

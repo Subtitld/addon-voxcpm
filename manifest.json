@@ -1,15 +1,15 @@
 {
   "manifest_version": 1,
   "id": "voxcpm",
-  "version": "0.0.1",
+  "version": "26.11.1",
   "display_name": "VoxCPM2 (offline, voice clone, 30 languages)",
-  "summary": "OpenBMB's VoxCPM2: speaks 30 languages at 48 kHz in the speaker's own voice, cloned from the video, or in a voice made from a description. Heavy: a 4.96 GB model downloaded on first use and about 7 GB of memory; on a CPU each second of speech takes several seconds to make.",
+  "summary": "OpenBMB's VoxCPM2: speaks 30 languages at 48 kHz in the speaker's own voice, cloned from the video, or in a voice made from a description. Heavy: a 2.96 GB model downloaded on first use and about 4.5 GB of memory; on a CPU each second of speech takes several seconds to make.",
   "author": "Subtitld",
   "homepage": "https://github.com/Subtitld/addon-voxcpm",
-  "license": "Apache-2.0 (add-on, VoxCPM code and VoxCPM2 weights)",
+  "license": "Apache-2.0 (add-on, VoxCPM2 weights, audio.cpp); MIT (ggml, cJSON, libyaml)",
   "executable": "bin/voxcpm-addon",
   "protocol": 1,
-  "startup_timeout_sec": 60,
+  "startup_timeout_sec": 30,
   "platforms": [
     "linux",
     "macos",
@@ -18,6 +18,7 @@
   "tasks": [
     "tts.synthesize"
   ],
+  "compute": "cpu",
   "voice_clone": true,
   "languages": [
     "ar",
@@ -104,61 +105,19 @@
   "models": [
     {
       "id": "voxcpm2",
-      "display_name": "VoxCPM2 (2.4B)",
-      "repo": "openbmb/VoxCPM2",
-      "revision": "32279effe8c19989596f05d353d1447f51d9e915",
-      "size_mb": 4731,
+      "display_name": "VoxCPM2 (2.4B, 8-bit)",
+      "repo": "audio-cpp/audio.cpp-gguf",
+      "revision": "32c1ce1fea57a513eb9386aa62408d47b1cf7ab2",
+      "size_mb": 2818,
       "license": "Apache-2.0",
       "bundled": false,
       "default": true
     }
   ],
-  "disk_required_mb": 5600,
-  "ram_required_mb": 7168,
-  "gpu": "optional",
+  "disk_required_mb": 3200,
+  "ram_required_mb": 4608,
   "config_schema": {
     "fields": [
-      {
-        "key": "device",
-        "type": "select",
-        "label": "Inference device",
-        "default": "auto",
-        "options": [
-          {
-            "value": "auto",
-            "label": "Automatic (the Apple GPU on Apple Silicon, else the CPU)"
-          },
-          {
-            "value": "cpu",
-            "label": "CPU"
-          },
-          {
-            "value": "mps",
-            "label": "Apple GPU (MPS)"
-          }
-        ],
-        "help": "This build runs on the CPU, or on the GPU of an Apple Silicon Mac. It does not use NVIDIA GPUs."
-      },
-      {
-        "key": "precision",
-        "type": "select",
-        "label": "Weight precision",
-        "default": "auto",
-        "options": [
-          {
-            "value": "auto",
-            "label": "Automatic: bfloat16, with the diffusion in float32 on a CPU (about 7 GB of memory)"
-          },
-          {
-            "value": "bfloat16",
-            "label": "bfloat16 throughout: about 6 GB, but fast only on CPUs with native bfloat16"
-          },
-          {
-            "value": "float32",
-            "label": "float32: about 11 GB of memory, a little faster"
-          }
-        ]
-      },
       {
         "key": "steps",
         "type": "int",

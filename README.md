@@ -34,20 +34,18 @@ language from the text.
 
 ## What it needs
 
-- **Disk:** about 5.6 GB. The model, 4.96 GB, downloads from Hugging Face on
-  the first synthesis, at a pinned revision, each file checked by sha256,
-  into Subtitld's model cache. An interrupted download resumes. `HF_ENDPOINT`
+- **Disk:** about 3.2 GB. The model, 2.96 GB, downloads from Hugging Face on
+  the first synthesis, at a pinned revision, checked by sha256, into
+  Subtitld's model cache. An interrupted download resumes. `HF_ENDPOINT`
   points it at a mirror; `VOXCPM_MODEL_DIR` at a folder that already holds
-  the files.
-- **Memory:** about 7 GB free with the default precision, 11 GB in float32.
-  The weights are memory-mapped, so with less free memory the add-on still
-  runs, but far slower, rereading them from disk.
+  the file. The PyTorch weights that versions before 26.11.1 downloaded
+  (4.96 GB) are removed once the new model checks out.
+- **Memory:** about 4.5 GB free. The model is memory-mapped, so with less free
+  memory the add-on still runs, but far slower, rereading it from disk.
 - **Time:** VoxCPM2 has 2.4B parameters, and on a CPU each second of speech
-  takes several seconds to make. On an Intel Core i7-13700T (8 performance
-  cores) with the defaults it is 5 to 6 seconds, a little less in float32.
-  *Quality steps* at 5 is about a quarter faster, with audibly less clarity.
-  The add-on runs on the CPU, or on the GPU of an Apple Silicon Mac; this
-  build does not use NVIDIA GPUs.
+  takes several seconds to make: about 4.5 seconds on an otherwise idle Intel
+  Core i7-13700T (8 performance cores) with the defaults. *Quality steps* at 5 is
+  faster, with audibly less clarity. The add-on runs on the CPU.
 
 After the download nothing leaves the machine.
 
@@ -55,8 +53,6 @@ After the download nothing leaves the machine.
 
 | Setting | Default | |
 |---|---|---|
-| Inference device | Automatic | CPU, or the Apple GPU (MPS) |
-| Weight precision | Automatic | bfloat16, with the diffusion in float32 on a CPU; float32 on the Apple GPU, which needs it |
 | Quality steps | 10 | diffusion steps; fewer is faster |
 | Guidance | 2.0 | how closely speech follows the text and voice |
 | CPU threads | 0 | the performance cores on a CPU that has efficiency cores too, else one per core |
@@ -64,58 +60,60 @@ After the download nothing leaves the machine.
 | Fallback reference clip / transcript | | for the cloned voice when Subtitld has no clip to send |
 | Clone the timbre only | off | see Voices |
 
+## How it runs the model
+
+Speech is made by [audio.cpp](https://github.com/0xShug0/audio.cpp)
+(Apache-2.0), a C++ runtime on ggml, which the add-on calls through its C API
+with ctypes. `tools/build_native.py` builds it from source at a pinned commit
+with only VoxCPM2 compiled in, and applies one patch,
+`tools/patches/audiocpp-step-callback.patch`: a callback before each generated
+step, so a line reports its progress and stops between two steps when it is
+cancelled. Upstream's C API runs a line to its end. ggml picks the build for
+the processor it runs on, from SSE4.2 to AVX-512.
+
+The model is VoxCPM2 with its weights in 8-bit (Q8_0), as audio.cpp's project
+converted it: 2.96 GB, against 4.96 GB for the original bfloat16 checkpoint.
+On the same lines, it was transcribed as accurately and sounded as close to
+the speaker as the original. On the same machine it made them about a fifth
+faster than the PyTorch build of this add-on, in half the memory.
+
+The add-on itself needs nothing but Python's standard library.
+
 ## Building
 
-Python 3.10 to 3.12. VoxCPM itself is installed without its dependencies:
-those add a web demo, training and a denoiser, none of which the add-on uses.
+Linux, in the AlmaLinux 8 container, so the archive runs on glibc 2.28 and
+newer (needs Docker):
 
 ```bash
-# Linux and Windows: the CPU build of PyTorch
-pip install --index-url https://download.pytorch.org/whl/cpu torch==2.14.1 torchaudio==2.11.0
-pip install -c constraints.txt -e '.[build,dev]'
-pip install --no-deps -c constraints.txt voxcpm
-pytest
+tools/build_linux.sh                      # audio.cpp, tests, the bundle, the archive
+tools/test_archive.sh almalinux:8         # the archive, installed as Subtitld does, on AlmaLinux 8
+```
+
+`VOXCPM_TEST_MODELS_DIR` (a folder holding `voxcpm/VoxCPM2-GGUF/`, or an empty
+one to download into) also has the archive speak and cancel for real. For the
+engine tests with the model, from source, set `VOXCPM_TEST_MODEL` to the GGUF
+file:
+
+```bash
+python tools/build_native.py              # Linux: tools/build_native_linux.sh
+pip install -e '.[build,dev]'
+VOXCPM_TEST_MODEL=/path/to/voxcpm2-q8_0.gguf pytest
 pyinstaller pyinstaller.spec --noconfirm
 dist/voxcpm-addon/voxcpm-addon --self-test
 ```
 
 The release workflow builds, proves and publishes every platform on a tag
-`v<version>` matching `manifest.json`. To run its Linux build locally, as
-GitHub runs it, use [act](https://github.com/nektos/act):
-
-```bash
-act workflow_dispatch -W .github/workflows/release.yml --input targets=linux-x86_64 \
-  -P ubuntu-22.04=catthehacker/ubuntu:act-22.04 --artifact-server-path /tmp/artifacts
-```
-
-A manual run on GitHub can build only some platforms (`targets`).
-`tools/collect_licences.py` fails the build when a native file in the bundle has
-no notice. The Linux archive carries numpy's libquadmath (LGPL-2.1), so the
-release attaches its complete source, built by `tools/build_libquadmath_source.py`.
-
-## How it runs the model
-
-VoxCPM2 imports librosa for two functions, reading a reference clip and
-trimming its silence. `voxcpm_addon/audio.py` provides them instead (librosa's
-trimming, checked against librosa), which keeps scipy, scikit-learn, numba,
-libsndfile and soxr, about 400 MB, out of the archive.
-
-Upstream's loader builds the 2.4B-parameter model in float32 before copying
-the checkpoint in, which peaks near 10 GB. This add-on builds it on PyTorch's
-`meta` device and hands it the memory-mapped checkpoint, so the peak is about
-the size of the weights.
-
-On a CPU the model stays in bfloat16 except its diffusion head and local
-encoder, 0.2B parameters each, which run in float32. The head does about three
-quarters of the work, and most CPUs have no native bfloat16: on the
-i7-13700T it halves the time of a line, from 9 to 11 seconds per second of
-speech in bfloat16 throughout to 5 to 6, for 0.8 GB more memory. See `voxcpm_addon/engine.py`.
+`v<version>` matching `manifest.json`; a manual run can build only some
+platforms (`targets`). `tools/assemble_licences.py` fails the build when a
+native file in the bundle has no notice. macOS and Windows builds of
+audio.cpp are not set up yet.
 
 ## Licence
 
-The add-on is Apache-2.0. VoxCPM's code and the VoxCPM2 weights are
-Apache-2.0 (OpenBMB). Each archive carries `THIRD_PARTY_LICENSES/` with the
-licence of everything frozen into it.
+The add-on is Apache-2.0. audio.cpp is Apache-2.0, with ggml, cJSON and
+libyaml (MIT) compiled in; the VoxCPM2 weights are Apache-2.0 (OpenBMB).
+Each archive carries `THIRD_PARTY_LICENSES/` with the licence of everything
+frozen into it, and our patch to audio.cpp.
 
 Voice cloning makes speech that sounds like a real person. Clone voices you
 have the right to use, and say that a dub is synthetic where it matters.

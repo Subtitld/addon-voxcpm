@@ -1,63 +1,75 @@
-"""VoxCPM2 for the add-on: fetch the weights, load them lean, synthesize.
+"""VoxCPM2 for the add-on: fetch the model, load it in audio.cpp, synthesize.
 
 Copyright 2026 Subtitld contributors
 SPDX-License-Identifier: Apache-2.0
 
-Weights
+Runtime
 -------
-VoxCPM2 is not in the archive: 4.96 GB, fetched on the first synthesis from
-Hugging Face at a pinned revision, each file checked against its sha256, into
-the host's model cache ($SUBTITLD_MODELS_DIR/voxcpm/VoxCPM2). An interrupted
-download resumes. $HF_ENDPOINT points it at a mirror; $VOXCPM_MODEL_DIR at a
-folder that already holds the files, which is then used as it is.
+Speech is made by audio.cpp (Apache-2.0), a ggml runtime, through its C API
+with ctypes: build/assets/audiocpp/ from source, `audiocpp/` inside the frozen
+bundle. tools/build_native.py builds it with only VoxCPM2 in, and with one
+patch: a callback before each generated step, by which a line reports its
+progress and is stopped between two steps. ggml picks the CPU backend for the
+processor it runs on.
 
-Loading
+Model
+-----
+VoxCPM2 as GGUF, its weights in 8-bit (Q8_0): 2.96 GB, about half the size of
+the original bfloat16 checkpoint and, in our listening and transcription
+tests, as good. It is fetched on the first synthesis from Hugging Face at a
+pinned revision of audio.cpp's model repository, checked against its sha256,
+into the host's model cache ($SUBTITLD_MODELS_DIR/voxcpm/VoxCPM2-GGUF). An
+interrupted download resumes. $HF_ENDPOINT points it at a mirror;
+$VOXCPM_MODEL_DIR at a folder that already holds the file, which is then used
+as it is. The PyTorch weights earlier versions downloaded (4.96 GB) are
+removed once the new file checks out.
+
+Threads
 -------
-Upstream's loader builds the model in float32 and copies the checkpoint into
-it, so loading the 2.4B parameters peaks near 10 GB. Here the model is built
-on PyTorch's `meta` device, without memory, and takes the checkpoint's tensors
-as they are: the peak is about the size of the weights. The only tensors the
-checkpoint does not hold, the rotary position tables, are rebuilt the way
-upstream builds them. Upstream's `optimize` (torch.compile) is CUDA-only and
-needs a compiler at run time, so it is not used. VoxCPM2 gets voxcpm_addon.audio
-in place of librosa (see there).
+On a CPU with performance and efficiency cores, the slower cores hold every
+step back: synthesis uses one thread per performance core, and on Linux the
+process is kept on those cores. Elsewhere it uses one thread per core.
 """
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import logging
 import os
+import shutil
 import ssl
 import subprocess
 import sys
-import threading
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from array import array
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from voxcpm_addon import __version__
+from voxcpm_addon import __version__, audio
 
 log = logging.getLogger('voxcpm_addon.engine')
 
-MODEL_REPO = 'openbmb/VoxCPM2'
-MODEL_REVISION = '32279effe8c19989596f05d353d1447f51d9e915'
-MODEL_DIRNAME = 'VoxCPM2'
+_PACKAGE = Path(__file__).resolve().parent
 
-# What the inference path reads, at MODEL_REVISION: (file, bytes, sha256).
-# The repo's tokenization_voxcpm2.py is not fetched: the tokenizer is loaded
-# as LlamaTokenizerFast from tokenizer.json, so no code from the repo runs.
+MODEL_REPO = 'audio-cpp/audio.cpp-gguf'
+MODEL_REVISION = '32c1ce1fea57a513eb9386aa62408d47b1cf7ab2'
+MODEL_DIRNAME = 'VoxCPM2-GGUF'
+
+# What audio.cpp reads, at MODEL_REVISION: (path in the repository, bytes,
+# sha256). Each is saved under its file name.
 MODEL_FILES = (
-    ('config.json', 4336, '405f0dcd92f7feba6011ed4eac5c8d4f74cba9712f07fd5cfa3063bbdd95402c'),
-    ('tokenizer.json', 3676772, 'f8984687e4a92a3503d521396d454b7d68e9fdaab2a0288eb3536c7c1aa4bc20'),
-    ('tokenizer_config.json', 5059, 'e78a3ebb48a0b9437efd1823b6b726c823da89e49dd8bcc90c02419d9baa772b'),
-    ('special_tokens_map.json', 1632, '068594063e37662c02b21acf42ebb334ef6a74fb810e68a2368f88f08351de76'),
-    ('audiovae.pth', 376951122, '94b5d51e107e0507d4acc976cfdadb64edd6fd06d1f751dadbf2fd1594274bf1'),
-    ('model.safetensors', 4580080592, 'f7f964cfa9da23653baec6e6f7750719977ad944ed9f95fe52fe3a620506891d'),
+    ('VoxCPM2-GGUF/voxcpm2-q8_0.gguf', 2955007488,
+     '8df1faf274e1bdeedef1fd9ddd6aba6632536f66f2e080991d2352af35ceef72'),
 )
+MODEL_FILE = 'voxcpm2-q8_0.gguf'
 MODEL_BYTES = sum(size for _name, size, _sha in MODEL_FILES)
+
+# The PyTorch weights of the add-on's versions before audio.cpp.
+TORCH_DIRNAME = 'VoxCPM2'
+TORCH_REVISION = '32279effe8c19989596f05d353d1447f51d9e915'
 
 _CHUNK = 1 << 20
 _VERIFIED = '.verified'
@@ -68,37 +80,48 @@ class Cancelled(Exception):
 
 
 class DownloadError(Exception):
-    """The weights could not be fetched or did not check out."""
+    """The model could not be fetched or did not check out."""
+
+
+class EngineError(Exception):
+    """audio.cpp failed, or could not be loaded."""
 
 
 # ---------------------------------------------------------------------------
-# Where the weights live
+# Where the model lives
 # ---------------------------------------------------------------------------
 def cache_root() -> Path:
-    """$SUBTITLD_MODELS_DIR/voxcpm: the weights and the described voices' anchors."""
+    """$SUBTITLD_MODELS_DIR/voxcpm: the model and the described voices' anchors."""
     base = (os.environ.get('SUBTITLD_MODELS_DIR') or '').strip()
     root = Path(os.path.expanduser(base)) if base else Path.home() / '.cache' / 'subtitld' / 'models'
     return root / 'voxcpm'
 
 
+def _user_folder() -> bool:
+    return bool((os.environ.get('VOXCPM_MODEL_DIR') or '').strip())
+
+
 def model_dir() -> Path:
-    override = (os.environ.get('VOXCPM_MODEL_DIR') or '').strip()
-    if override:
-        return Path(os.path.expanduser(override))
+    if _user_folder():
+        return Path(os.path.expanduser(os.environ['VOXCPM_MODEL_DIR'].strip()))
     return cache_root() / MODEL_DIRNAME
+
+
+def _local(name: str) -> str:
+    return name.rsplit('/', 1)[-1]
 
 
 def weights_present(folder: Path) -> bool:
     """True when every file is there at its expected size, checked once by sha256."""
-    if (os.environ.get('VOXCPM_MODEL_DIR') or '').strip():
-        return all((folder / name).is_file() for name, _size, _sha in MODEL_FILES)
+    if _user_folder():
+        return all((folder / _local(name)).is_file() for name, _size, _sha in MODEL_FILES)
     marker = folder / _VERIFIED
     try:
         if marker.read_text(encoding='utf-8').strip() != MODEL_REVISION:
             return False
     except OSError:
         return False
-    return all((folder / name).is_file() and (folder / name).stat().st_size == size
+    return all((folder / _local(name)).is_file() and (folder / _local(name)).stat().st_size == size
                for name, size, _sha in MODEL_FILES)
 
 
@@ -106,21 +129,19 @@ def missing_bytes(folder: Path) -> int:
     """Bytes still to download, counting partial files as progress."""
     total = 0
     for name, size, _sha in MODEL_FILES:
-        path = folder / name
+        path = folder / _local(name)
         if path.is_file() and path.stat().st_size == size:
             continue
-        part = folder / (name + '.part')
+        part = folder / (_local(name) + '.part')
         have = part.stat().st_size if part.is_file() else 0
         total += max(0, size - have)
     return total
 
 
 def _ssl_context() -> ssl.SSLContext:
-    try:
-        import certifi  # frozen macOS builds have no system CA bundle Python can read
-        return ssl.create_default_context(cafile=certifi.where())
-    except Exception:  # noqa: BLE001
-        return ssl.create_default_context()
+    # voxcpm_addon.tls has set SSL_CERT_FILE for the frozen Linux and macOS
+    # builds; elsewhere this is the platform's own trust store.
+    return ssl.create_default_context()
 
 
 def _sha256(path: Path, cancel: Callable[[], bool]) -> str:
@@ -174,8 +195,8 @@ def ensure_weights(folder: Path, progress: Callable[[int, int], None],
     """Download whatever is missing. `progress(done, total)` is in bytes."""
     if weights_present(folder):
         return
-    if (os.environ.get('VOXCPM_MODEL_DIR') or '').strip():
-        missing = [name for name, _s, _h in MODEL_FILES if not (folder / name).is_file()]
+    if _user_folder():
+        missing = [_local(name) for name, _s, _h in MODEL_FILES if not (folder / _local(name)).is_file()]
         raise DownloadError(f'VOXCPM_MODEL_DIR={folder} lacks {", ".join(missing)}')
     folder.mkdir(parents=True, exist_ok=True)
     endpoint = (os.environ.get('HF_ENDPOINT') or 'https://huggingface.co').rstrip('/')
@@ -188,10 +209,10 @@ def ensure_weights(folder: Path, progress: Callable[[int, int], None],
         progress(min(done, total), total)
 
     for name, size, sha256 in MODEL_FILES:
-        dest = folder / name
+        dest = folder / _local(name)
         if dest.is_file() and dest.stat().st_size == size and _sha256(dest, cancel) == sha256:
             continue
-        part = folder / (name + '.part')
+        part = folder / (_local(name) + '.part')
         before = part.stat().st_size if part.is_file() else 0
         done -= before  # _fetch reports the bytes already on disk again
         url = f'{endpoint}/{MODEL_REPO}/resolve/{MODEL_REVISION}/{name}'
@@ -200,36 +221,34 @@ def ensure_weights(folder: Path, progress: Callable[[int, int], None],
     (folder / _VERIFIED).write_text(MODEL_REVISION + '\n', encoding='utf-8')
 
 
+def retire_torch_weights() -> list[Path]:
+    """Remove what the PyTorch versions of the add-on downloaded. Returns what went.
+
+    Only from the host's model cache, and only the weights folder that carries
+    their own verified marker; and the anchor clips those versions made, which
+    the new model does not reuse.
+    """
+    if _user_folder():
+        return []
+    root = cache_root()
+    old = root / TORCH_DIRNAME
+    try:
+        if (old / _VERIFIED).read_text(encoding='utf-8').strip() != TORCH_REVISION:
+            return []
+    except OSError:
+        return []
+    removed = [old]
+    shutil.rmtree(old, ignore_errors=True)
+    anchors = root / 'anchors'
+    if anchors.is_dir():
+        shutil.rmtree(anchors, ignore_errors=True)
+        removed.append(anchors)
+    return removed
+
+
 # ---------------------------------------------------------------------------
-# Loading
+# Threads
 # ---------------------------------------------------------------------------
-# VoxCPM2 runs its decoding loop as `for i in tqdm(range(max_len))`. The tqdm
-# it imported is swapped for this, which reports each step to the thread's
-# callback: progress, and a cancel that stops a line between two steps. Every
-# generation refills the KV cache from its prompt, so stopping one leaves
-# nothing behind for the next.
-_step = threading.local()
-
-# Decoding steps per second of audio: 25 latent frames a second, 4 per step.
-STEPS_PER_SECOND = 6.25
-
-
-def _stepping(iterable, *_args, **_kwargs):
-    callback = getattr(_step, 'callback', None)
-    for index, item in enumerate(iterable):
-        if callback is not None:
-            callback(index)
-        yield item
-
-
-@dataclass
-class Loaded:
-    model: object          # voxcpm.VoxCPM
-    device: str
-    dtype: str
-    sample_rate: int
-
-
 def _cpu_list(text: str) -> list[int]:
     """'0-3,8,10-11' -> [0, 1, 2, 3, 8, 10, 11]"""
     cpus: list[int] = []
@@ -242,187 +261,322 @@ def _cpu_list(text: str) -> list[int]:
     return cpus
 
 
-def performance_cores() -> int:
-    """Physical performance cores of a hybrid CPU; 0 when not hybrid or not known.
+def performance_cpus() -> list[int]:
+    """The logical CPUs of a hybrid processor's performance cores, on Linux; [] otherwise."""
+    if not sys.platform.startswith('linux'):
+        return []
+    try:
+        return _cpu_list(Path('/sys/devices/cpu_core/cpus').read_text())
+    except (OSError, ValueError):
+        return []
 
-    PyTorch's default, one thread per physical core, counts efficiency cores
-    too, and the slower cores then hold every step back: on a 13th-gen Intel
-    with 8 performance and 8 efficiency cores, 8 threads synthesize about a
-    quarter faster than 16.
-    """
+
+def _physical(cpus: list[int]) -> int:
+    """How many physical cores the logical CPUs `cpus` are, on Linux."""
+    cores = set()
+    for cpu in cpus:
+        topology = Path(f'/sys/devices/system/cpu/cpu{cpu}/topology')
+        try:
+            cores.add(((topology / 'physical_package_id').read_text().strip(),
+                       (topology / 'core_id').read_text().strip()))
+        except OSError:
+            cores.add(('cpu', str(cpu)))
+    return len(cores)
+
+
+def _sysctl(*names: str) -> list[int]:
+    out = subprocess.run(['sysctl', '-n', *names], capture_output=True, text=True, timeout=5)
+    return [int(line) for line in out.stdout.split()]
+
+
+def default_threads() -> int:
+    """One thread per performance core of a hybrid CPU, else one per core."""
     try:
         if sys.platform.startswith('linux'):
-            cpus = _cpu_list(Path('/sys/devices/cpu_core/cpus').read_text())
-            siblings = Path(f'/sys/devices/system/cpu/cpu{cpus[0]}/topology/thread_siblings_list')
-            return max(1, len(cpus) // max(1, len(_cpu_list(siblings.read_text()))))
+            cpus = performance_cpus() or sorted(os.sched_getaffinity(0))
+            return max(1, _physical(cpus))
         if sys.platform == 'darwin':
-            out = subprocess.run(['sysctl', '-n', 'hw.perflevel0.physicalcpu', 'hw.perflevel1.physicalcpu'],
-                                 capture_output=True, text=True, timeout=5)
-            counts = [int(line) for line in out.stdout.split()]
-            return counts[0] if len(counts) == 2 and counts[1] > 0 else 0
+            counts = _sysctl('hw.perflevel0.physicalcpu')
+            return max(1, counts[0]) if counts else max(1, _sysctl('hw.physicalcpu')[0])
     except (OSError, ValueError, IndexError, subprocess.SubprocessError):
         pass
-    return 0
+    logical = os.cpu_count() or 4
+    return max(1, logical // 2 if logical >= 4 else logical)
 
 
-def resolve_device(choice: str) -> str:
-    import torch
-    choice = (choice or 'auto').strip().lower()
-    if choice == 'auto':
-        if torch.cuda.is_available():
-            return 'cuda'
-        mps = getattr(torch.backends, 'mps', None)
-        if mps is not None and mps.is_available():
-            return 'mps'
-        return 'cpu'
-    return choice
-
-
-def resolve_precision(choice: str, device: str) -> tuple[str, bool]:
-    """(the model's dtype, whether its diffusion head and encoder run in float32).
-
-    Automatic is bfloat16, which halves the memory, with the two small parts
-    that do most of the work in float32 on a CPU (see _in_float32). MPS needs
-    float32 throughout (upstream's finding).
-    """
-    choice = (choice or 'auto').strip().lower()
-    if device == 'mps':
-        return 'float32', False
-    if choice in ('bfloat16', 'float32'):
-        return choice, False
-    return 'bfloat16', device == 'cpu'
-
-
-def _in_float32(module):
-    """`module` run in float32 inside a bfloat16 model: tensors in, cast up; out, cast back.
-
-    Used, on a CPU, for the diffusion head (VoxCPM2's LocDiT and its Euler solver)
-    and the local encoder, 0.2B parameters each. The head does about three
-    quarters of the work of a step: 12 layers, run twice (guidance) for each
-    diffusion step. On CPUs without native bfloat16 the bfloat16 kernels are
-    several times slower than float32 ones, so this roughly halves the time of
-    a line for 0.8 GB more memory, and is no less accurate.
-    """
-    import torch
-
-    def up(value):
-        return value.float() if torch.is_tensor(value) and value.is_floating_point() else value
-
-    class InFloat32(torch.nn.Module):
-        def __init__(self, inner):
-            super().__init__()
-            self.inner = inner.float()
-
-        def forward(self, *args, **kwargs):
-            dtype = next(a.dtype for a in (*args, *kwargs.values())
-                         if torch.is_tensor(a) and a.is_floating_point())
-            out = self.inner(*map(up, args), **{k: up(v) for k, v in kwargs.items()})
-            return out.to(dtype)
-
-    return InFloat32(module)
-
-
-def without_librosa() -> None:
-    """Give VoxCPM2, which imports librosa for two functions, voxcpm_addon.audio instead."""
-    from voxcpm_addon import audio
-    sys.modules['librosa'] = audio
-
-
-def load(folder: Path, device: str, dtype: str, threads: int = 0,
-         float32_head: bool = False) -> Loaded:
-    without_librosa()
-    import torch
-    from safetensors.torch import load_file
-    from transformers import LlamaTokenizerFast
-    from voxcpm.core import VoxCPM
-    from voxcpm.model import voxcpm2 as v2
-    from voxcpm.modules.audiovae import AudioVAEV2
-    from voxcpm.modules.minicpm4.model import MiniCPMLongRoPE
-
-    v2.tqdm = _stepping
-    threads = threads if threads > 0 else performance_cores()
-    if threads > 0:
-        torch.set_num_threads(threads)
-    config = v2.VoxCPMConfig.model_validate_json((folder / 'config.json').read_text(encoding='utf-8'))
-    config.dtype = dtype
-    tokenizer = LlamaTokenizerFast.from_pretrained(str(folder))
-    with torch.device('meta'):
-        audio_vae = AudioVAEV2(config=config.audio_vae_config)
-        model = v2.VoxCPM2Model(config, tokenizer, audio_vae, None, device=device)
-    lm_dtype = v2.get_dtype(model.config.dtype)
-
-    # Each tensor goes straight to its device and dtype, so no second copy of
-    # the model is ever made. On a CPU in bfloat16 `.to()` changes nothing and
-    # the weights stay memory-mapped from the file.
-    state = load_file(str(folder / 'model.safetensors'))
-    for key in list(state):
-        tensor = state[key]
-        state[key] = tensor.to(device=device, dtype=lm_dtype if tensor.is_floating_point() else tensor.dtype)
-    vae = torch.load(folder / 'audiovae.pth', map_location='cpu', weights_only=True)
-    vae = vae.get('state_dict', vae)
-    for key, tensor in vae.items():
-        # Upstream keeps the audio VAE in float32 whatever the model's dtype.
-        state[f'audio_vae.{key}'] = tensor.to(
-            device=device, dtype=torch.float32 if tensor.is_floating_point() else tensor.dtype)
-    del vae
-    missing, unexpected = model.load_state_dict(state, strict=False, assign=True)
-    del state
-    if unexpected:
-        raise RuntimeError(f'checkpoint has tensors the model does not: {unexpected[:5]}')
-
-    # The rotary tables are computed, not stored: rebuild them, in the
-    # model's dtype as upstream's `model.to(dtype)` leaves them.
-    for parent in list(model.modules()):
-        for name, child in list(parent.named_children()):
-            if isinstance(child, MiniCPMLongRoPE):
-                setattr(parent, name, MiniCPMLongRoPE(child.config).to(device=device, dtype=lm_dtype))
-
-    on_meta = [name for name, tensor in list(model.named_parameters()) + list(model.named_buffers())
-               if tensor.is_meta]
-    if on_meta:
-        raise RuntimeError(f'not loaded: {", ".join(on_meta[:5])}')
-    if float32_head and lm_dtype != torch.float32:
-        model.feat_decoder = _in_float32(model.feat_decoder)
-        model.feat_encoder = _in_float32(model.feat_encoder)
-    model = model.to(device).eval()
-
-    wrapper = VoxCPM.__new__(VoxCPM)  # upstream's __init__ loads the model its own way
-    wrapper.tts_model = model
-    wrapper.text_normalizer = None
-    wrapper.denoiser = None
-    return Loaded(model=wrapper, device=device, dtype=model.config.dtype, sample_rate=int(model.sample_rate))
-
-
-# ---------------------------------------------------------------------------
-# Synthesis
-# ---------------------------------------------------------------------------
-def synthesize(loaded: Loaded, text: str, *, prompt_wav: str | None = None,
-               prompt_text: str | None = None, reference_wav: str | None = None,
-               cfg_value: float = 2.0, steps: int = 10, seed: int | None = None,
-               on_step: Callable[[int], None] | None = None):
-    """A float32 waveform at `loaded.sample_rate`.
-
-    `reference_wav` alone clones the voice in it. `prompt_wav` with its exact
-    transcript `prompt_text` continues from that clip, which comes closer to
-    the speaker. A text that starts with a description in parentheses
-    describes the voice to make. `on_step(index)` runs before each decoding
-    step; raising from it stops the line.
-    """
-    import torch
-    if seed is not None:
-        torch.manual_seed(int(seed) & 0xFFFFFFFF)
-    _step.callback = on_step
+def keep_to_performance_cores() -> list[int]:
+    """On Linux with a hybrid CPU, keep this process on its performance cores. Returns them, or []."""
+    cpus = performance_cpus()
+    if not cpus:
+        return []
     try:
-        with torch.inference_mode():
-            return loaded.model.generate(
-                text=text,
-                prompt_wav_path=prompt_wav,
-                prompt_text=prompt_text,
-                reference_wav_path=reference_wav,
-                cfg_value=float(cfg_value),
-                inference_timesteps=int(steps),
-                normalize=False,
-                denoise=False,
-            )
+        allowed = os.sched_getaffinity(0)
+        chosen = [cpu for cpu in cpus if cpu in allowed]
+        if chosen and set(chosen) != allowed:
+            os.sched_setaffinity(0, chosen)
+        return chosen
+    except OSError:
+        return []
+
+
+# ---------------------------------------------------------------------------
+# audio.cpp's C API (include/audiocpp.h, with tools/patches/)
+# ---------------------------------------------------------------------------
+LIBRARY = {'linux': 'libaudiocpp.so.0', 'darwin': 'libaudiocpp.0.dylib', 'win32': 'audiocpp.dll'}
+ABI_MAJOR = 0
+
+OK = 0
+ERR_OUT_OF_MEMORY = 5
+ERR_CANCELLED = 8
+
+_LOG_LEVELS = {1: logging.DEBUG, 2: logging.DEBUG, 3: logging.WARNING, 4: logging.ERROR}
+
+
+class _BackendConfig(ctypes.Structure):
+    _fields_ = [('backend', ctypes.c_char_p), ('device', ctypes.c_int), ('threads', ctypes.c_int)]
+
+
+class _ModelConfig(ctypes.Structure):
+    _fields_ = [('family_hint', ctypes.c_char_p), ('config_id', ctypes.c_char_p),
+                ('weight_id', ctypes.c_char_p), ('model_spec_override', ctypes.c_char_p)]
+
+
+_STEP_CALLBACK = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int64, ctypes.c_void_p)
+_LOG_CALLBACK = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p)
+
+
+def runtime_dir() -> Path:
+    """Where audio.cpp is: $VOXCPM_AUDIOCPP_DIR, the frozen bundle's, or build/assets/audiocpp/."""
+    override = (os.environ.get('VOXCPM_AUDIOCPP_DIR') or '').strip()
+    if override:
+        return Path(os.path.expanduser(override))
+    if getattr(sys, 'frozen', False):
+        return Path(getattr(sys, '_MEIPASS', Path(sys.executable).parent)) / 'audiocpp'
+    return _PACKAGE.parent / 'build' / 'assets' / 'audiocpp'
+
+
+_lib = None
+_log_callback = None  # kept alive for as long as the library may call it
+
+
+def _on_log(level: int, text: bytes, _user) -> None:
+    message = (text or b'').decode('utf-8', 'replace').rstrip()
+    if message:
+        log.log(_LOG_LEVELS.get(level, logging.DEBUG), 'audio.cpp: %s', message)
+
+
+def load_library():
+    """audio.cpp's C library, loaded once, with its functions typed."""
+    global _lib, _log_callback
+    if _lib is not None:
+        return _lib
+    folder = runtime_dir()
+    path = folder / LIBRARY.get(sys.platform, LIBRARY['linux'])
+    if not path.is_file():
+        raise EngineError(f'audio.cpp is missing: no {path}')
+    if sys.platform == 'win32':
+        os.add_dll_directory(str(folder))
+    try:
+        lib = ctypes.CDLL(str(path))
+    except OSError as exc:
+        raise EngineError(f'could not load {path.name}: {exc}') from exc
+
+    c = ctypes
+    handle = c.POINTER(c.c_void_p)
+    signatures = {
+        'audiocpp_abi_version': (c.c_uint32, []),
+        'audiocpp_build_version': (c.c_char_p, []),
+        'audiocpp_last_error': (c.c_char_p, []),
+        'audiocpp_log_set': (None, [_LOG_CALLBACK, c.c_void_p]),
+        'audiocpp_registry_create': (c.c_int, [c.c_char_p, handle]),
+        'audiocpp_registry_free': (None, [c.c_void_p]),
+        'audiocpp_registry_family_count': (c.c_size_t, [c.c_void_p]),
+        'audiocpp_registry_family': (c.c_int, [c.c_void_p, c.c_size_t, c.POINTER(c.c_char_p)]),
+        'audiocpp_options_create': (c.c_void_p, []),
+        'audiocpp_options_set': (c.c_int, [c.c_void_p, c.c_char_p, c.c_char_p]),
+        'audiocpp_options_free': (None, [c.c_void_p]),
+        'audiocpp_model_load': (c.c_int, [c.c_void_p, c.c_char_p, c.POINTER(_ModelConfig), c.c_void_p, handle]),
+        'audiocpp_model_free': (None, [c.c_void_p]),
+        'audiocpp_session_create': (c.c_int, [c.c_void_p, c.c_char_p, c.c_char_p, c.POINTER(_BackendConfig),
+                                              c.c_void_p, handle]),
+        'audiocpp_session_free': (None, [c.c_void_p]),
+        'audiocpp_session_set_step_callback': (c.c_int, [c.c_void_p, _STEP_CALLBACK, c.c_void_p]),
+        'audiocpp_session_run': (c.c_int, [c.c_void_p, c.c_void_p, handle]),
+        'audiocpp_request_create': (c.c_void_p, []),
+        'audiocpp_request_free': (None, [c.c_void_p]),
+        'audiocpp_request_set_text': (c.c_int, [c.c_void_p, c.c_char_p, c.c_char_p]),
+        'audiocpp_request_set_voice_audio': (c.c_int, [c.c_void_p, c.POINTER(c.c_float), c.c_size_t,
+                                                       c.c_int, c.c_int]),
+        'audiocpp_request_set_option': (c.c_int, [c.c_void_p, c.c_char_p, c.c_char_p]),
+        'audiocpp_result_free': (None, [c.c_void_p]),
+        'audiocpp_result_audio': (c.c_int, [c.c_void_p, c.POINTER(c.POINTER(c.c_float)), c.POINTER(c.c_size_t),
+                                            c.POINTER(c.c_int), c.POINTER(c.c_int)]),
+    }
+    for name, (restype, argtypes) in signatures.items():
+        try:
+            function = getattr(lib, name)
+        except AttributeError as exc:
+            # audiocpp_session_set_step_callback is ours: a library without it
+            # was built without tools/patches/, and a line could not be stopped.
+            raise EngineError(f'{path.name} has no {name}: not the build tools/build_native.py makes') from exc
+        function.restype = restype
+        function.argtypes = argtypes
+    abi = lib.audiocpp_abi_version()
+    if abi >> 16 != ABI_MAJOR:
+        raise EngineError(f'{path.name} has C ABI {abi >> 16}.{(abi >> 8) & 0xFF}, the add-on needs {ABI_MAJOR}.x')
+    _log_callback = _LOG_CALLBACK(_on_log)
+    lib.audiocpp_log_set(_log_callback, None)
+    _lib = lib
+    return lib
+
+
+def runtime_version() -> str:
+    lib = load_library()
+    abi = lib.audiocpp_abi_version()
+    return f'audio.cpp {lib.audiocpp_build_version().decode()} (C ABI {abi >> 16}.{(abi >> 8) & 0xFF})'
+
+
+def families() -> list[str]:
+    """The model families this build of audio.cpp has; ['voxcpm2'] for ours."""
+    lib = load_library()
+    registry = ctypes.c_void_p()
+    _check(lib, lib.audiocpp_registry_create(None, ctypes.byref(registry)), 'registry')
+    try:
+        names = []
+        for index in range(lib.audiocpp_registry_family_count(registry)):
+            name = ctypes.c_char_p()
+            _check(lib, lib.audiocpp_registry_family(registry, index, ctypes.byref(name)), 'registry')
+            names.append(name.value.decode())
+        return names
     finally:
-        _step.callback = None
+        lib.audiocpp_registry_free(registry)
+
+
+def _check(lib, status: int, what: str) -> None:
+    if status == OK:
+        return
+    detail = (lib.audiocpp_last_error() or b'').decode('utf-8', 'replace')
+    if status == ERR_CANCELLED:
+        raise Cancelled()
+    if status == ERR_OUT_OF_MEMORY:
+        raise MemoryError(f'{what}: {detail}')
+    raise EngineError(f'{what}: {detail}')
+
+
+# ---------------------------------------------------------------------------
+# Loading and synthesis
+# ---------------------------------------------------------------------------
+# Decoding steps per second of audio: 25 latent frames a second, 4 per step.
+STEPS_PER_SECOND = 6.25
+
+# Encoded reference clips the session keeps, so a speaker's next line skips
+# encoding its clip again. A dub alternates between a few speakers.
+PROMPT_CACHE_SLOTS = 8
+
+
+@dataclass
+class Loaded:
+    lib: object
+    registry: ctypes.c_void_p
+    model: ctypes.c_void_p
+    session: ctypes.c_void_p
+    threads: int
+    cpus: list[int] = field(default_factory=list)
+
+
+def load(path: Path, threads: int = 0) -> Loaded:
+    """VoxCPM2 from the GGUF file at `path`, in a CPU session."""
+    lib = load_library()
+    cpus = keep_to_performance_cores()
+    threads = threads if threads > 0 else default_threads()
+    registry, model, session = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
+    options = lib.audiocpp_options_create()
+    try:
+        _check(lib, lib.audiocpp_registry_create(None, ctypes.byref(registry)), 'registry')
+        _check(lib, lib.audiocpp_model_load(registry, str(path).encode(),
+                                            ctypes.byref(_ModelConfig(b'voxcpm2', None, None, None)),
+                                            None, ctypes.byref(model)), 'loading VoxCPM2')
+        _check(lib, lib.audiocpp_options_set(options, b'voxcpm2.prompt_cache_slots',
+                                             str(PROMPT_CACHE_SLOTS).encode()), 'session options')
+        _check(lib, lib.audiocpp_session_create(model, b'tts', b'offline',
+                                                ctypes.byref(_BackendConfig(b'cpu', 0, threads)),
+                                                options, ctypes.byref(session)), 'session')
+    except BaseException:
+        lib.audiocpp_session_free(session)
+        lib.audiocpp_model_free(model)
+        lib.audiocpp_registry_free(registry)
+        raise
+    finally:
+        lib.audiocpp_options_free(options)
+    return Loaded(lib=lib, registry=registry, model=model, session=session, threads=threads, cpus=cpus)
+
+
+def close(loaded: Loaded) -> None:
+    loaded.lib.audiocpp_session_free(loaded.session)
+    loaded.lib.audiocpp_model_free(loaded.model)
+    loaded.lib.audiocpp_registry_free(loaded.registry)
+
+
+def synthesize(loaded: Loaded, text: str, *, reference: str | None = None,
+               reference_text: str | None = None, cfg_value: float = 2.0, steps: int = 10,
+               seed: int = 0, on_step: Callable[[int], None] | None = None) -> tuple[array, int]:
+    """(float32 mono samples, their sample rate) of `text` spoken.
+
+    `reference`, a 16-bit WAV file, alone clones the voice in it. With its
+    exact transcript `reference_text` the line continues from the clip, which
+    comes closer to the speaker. A text that starts with a description in
+    parentheses describes the voice to make. `on_step(index)` runs before each
+    decoding step; raising from it stops the line, and the exception comes out
+    of here.
+    """
+    lib = loaded.lib
+    stopped: list[BaseException] = []
+
+    def step(index: int, _user) -> int:
+        if on_step is None:
+            return 0
+        try:
+            on_step(int(index))
+        except BaseException as exc:  # noqa: BLE001 — carried out of the C call, raised below
+            stopped.append(exc)
+            return 1
+        return 0
+
+    callback = _STEP_CALLBACK(step)
+    request = lib.audiocpp_request_create()
+    result = ctypes.c_void_p()
+    try:
+        _check(lib, lib.audiocpp_request_set_text(request, text.encode('utf-8'), None), 'text')
+        if reference:
+            clip = audio.read_wav(reference)
+            samples = (ctypes.c_float * len(clip.samples)).from_buffer(clip.samples)
+            _check(lib, lib.audiocpp_request_set_voice_audio(request, samples, clip.frames, clip.rate,
+                                                             clip.channels), 'reference clip')
+            if reference_text:
+                _check(lib, lib.audiocpp_request_set_option(request, b'reference_text',
+                                                            reference_text.encode('utf-8')), 'transcript')
+                _check(lib, lib.audiocpp_request_set_option(request, b'ultimate_clone', b'true'), 'transcript')
+        for key, value in (('guidance_scale', f'{float(cfg_value):g}'), ('num_inference_steps', str(int(steps))),
+                           ('seed', str(int(seed) & 0xFFFFFFFF))):
+            _check(lib, lib.audiocpp_request_set_option(request, key.encode(), value.encode()), key)
+        _check(lib, lib.audiocpp_session_set_step_callback(loaded.session, callback, None), 'step callback')
+        try:
+            status = lib.audiocpp_session_run(loaded.session, request, ctypes.byref(result))
+        finally:
+            lib.audiocpp_session_set_step_callback(loaded.session, _STEP_CALLBACK(), None)
+        if stopped:
+            raise stopped[0]
+        _check(lib, status, 'synthesis')
+        data, frames = ctypes.POINTER(ctypes.c_float)(), ctypes.c_size_t()
+        rate, channels = ctypes.c_int(), ctypes.c_int()
+        _check(lib, lib.audiocpp_result_audio(result, ctypes.byref(data), ctypes.byref(frames),
+                                              ctypes.byref(rate), ctypes.byref(channels)), 'synthesis')
+        out = array('f')
+        out.frombytes(ctypes.string_at(data, frames.value * channels.value * 4))
+        if channels.value > 1:
+            n = channels.value
+            out = array('f', (sum(out[i:i + n]) / n for i in range(0, len(out) - n + 1, n)))
+        return out, rate.value
+    finally:
+        lib.audiocpp_result_free(result)
+        lib.audiocpp_request_free(request)

@@ -3,11 +3,12 @@ GCC runtime libraries — GPL-3.0-or-later WITH GCC-exception-3.1
 Texts: COPYING3 and COPYING.RUNTIME, from the GCC source tree.
 Upstream: https://gcc.gnu.org/
 
-Bundled libraries:
-  * libgomp (GNU OpenMP): PyTorch's CPU thread pool on Linux.
-  * libstdc++ and libgcc_s: copied from the build machine, for the C++ libraries.
-  * libgfortran: from the numpy wheel, for OpenBLAS (on Windows, compiled into
-    the OpenBLAS DLL).
+Linux: audio.cpp's libraries (libaudiocpp, libggml*) are built with GCC 14
+from AlmaLinux 8's gcc-toolset-14, which links the parts of libstdc++ newer
+than the system's GCC 8, and libgcc, into the libraries themselves; the rest
+of libstdc++ and libgcc_s come from the system the add-on runs on. On macOS
+and Windows they are built with Apple's and Microsoft's compilers and carry
+no GCC code.
 
 The GCC Runtime Library Exception lets these libraries travel with a program
 under another licence without the program becoming GPL. No source offer is

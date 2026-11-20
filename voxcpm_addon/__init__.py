@@ -8,6 +8,6 @@ The package exists so the entry point can run both from source
 (`bin/voxcpm-addon`).
 """
 
-__version__ = '0.0.1'
+__version__ = '26.11.1'
 ADDON_ID = 'voxcpm'
 PROTOCOL_VERSION = 1

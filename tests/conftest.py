@@ -6,16 +6,18 @@ SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
-import numpy as np
+from array import array
+
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from voxcpm_addon import __main__ as addon  # noqa: E402
-from voxcpm_addon import engine  # noqa: E402
+from voxcpm_addon import audio, engine  # noqa: E402
 
 
 class FakeModel:
@@ -26,9 +28,9 @@ class FakeModel:
         self.loads = 0
         self.steps = 8
 
-    def load(self, folder, device, dtype, threads=0, float32_head=False):
+    def load(self, path, threads=0):
         self.loads += 1
-        return engine.Loaded(model=None, device=device, dtype=dtype, sample_rate=48000)
+        return engine.Loaded(lib=None, registry=None, model=None, session=None, threads=threads or 4)
 
     def synthesize(self, loaded, text, **kwargs):
         self.calls.append((text, kwargs))
@@ -36,7 +38,7 @@ class FakeModel:
         for index in range(self.steps):
             if on_step is not None:
                 on_step(index)
-        return (0.25 * np.sin(np.arange(4800) / 10.0)).astype(np.float32)
+        return array('f', (0.25 * math.sin(i / 10.0) for i in range(4800))), 48000
 
 
 @pytest.fixture
@@ -49,7 +51,6 @@ def run(monkeypatch, tmp_path):
     monkeypatch.setattr(engine, 'weights_present', lambda folder: True)
     monkeypatch.setattr(engine, 'load', fake.load)
     monkeypatch.setattr(engine, 'synthesize', fake.synthesize)
-    monkeypatch.setattr(engine, 'resolve_device', lambda choice: 'cpu')
     monkeypatch.setenv('SUBTITLD_MODELS_DIR', str(tmp_path / 'models'))
     monkeypatch.setenv('SUBTITLD_TEMP_DIR', str(tmp_path))
     for name in ('VOXCPM_VOICE_DESCRIPTION', 'VOXCPM_VOICE_REF_AUDIO', 'VOXCPM_VOICE_REF_TEXT',
@@ -81,5 +82,10 @@ def run(monkeypatch, tmp_path):
 def reference(tmp_path):
     """A one-second WAV standing in for the speaker's clip."""
     path = tmp_path / 'speaker.wav'
-    addon._write_wav(path, np.zeros(16000, dtype=np.float32), 16000)
+    audio.write_wav(path, array('f', bytes(4 * 16000)), 16000)
     return str(path)
+
+
+def pytest_configure(config):
+    # Also declared in pyproject.toml, which tools/test_archive.sh does not mount.
+    config.addinivalue_line('markers', 'weights: needs the 2.96 GB VoxCPM2 model (local runs only)')

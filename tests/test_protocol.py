@@ -32,9 +32,8 @@ def test_clone_with_transcript_continues_from_the_clip(run, reference, tmp_path)
     assert result['type'] == 'result', result
     text, kwargs = fake.calls[0]
     assert text == 'Olá, mundo'
-    assert kwargs['reference_wav'] == reference
-    assert kwargs['prompt_wav'] == reference
-    assert kwargs['prompt_text'] == 'Hello there'
+    assert kwargs['reference'] == reference
+    assert kwargs['reference_text'] == 'Hello there'
     assert kwargs['seed'] == 7
     data = result['data']
     assert data['path'] == str(out) and data['sample_rate'] == 48000 and data['channels'] == 1
@@ -51,8 +50,8 @@ def test_clone_without_transcript_clones_the_timbre_only(run, reference, tmp_pat
                         'voice_ref_audio': reference})
     assert _terminal(frames)['type'] == 'result'
     kwargs = fake.calls[0][1]
-    assert kwargs['reference_wav'] == reference
-    assert 'prompt_wav' not in kwargs and 'prompt_text' not in kwargs
+    assert kwargs['reference'] == reference
+    assert kwargs['reference_text'] is None
 
 
 def test_clone_falls_back_to_the_configured_clip(run, reference, tmp_path, monkeypatch):
@@ -60,7 +59,7 @@ def test_clone_falls_back_to_the_configured_clip(run, reference, tmp_path, monke
     monkeypatch.setenv('VOXCPM_VOICE_REF_TEXT', 'configured words')
     frames, fake = run({'text': 'Hi', 'voice': voices.CLONE, 'output_path': str(tmp_path / 'a.wav')})
     assert _terminal(frames)['type'] == 'result'
-    assert fake.calls[0][1]['prompt_text'] == 'configured words'
+    assert fake.calls[0][1]['reference_text'] == 'configured words'
 
 
 def test_the_configured_transcript_never_pairs_with_the_hosts_clip(run, reference, tmp_path, monkeypatch):
@@ -68,7 +67,7 @@ def test_the_configured_transcript_never_pairs_with_the_hosts_clip(run, referenc
     frames, fake = run({'text': 'Hi', 'voice': voices.CLONE, 'output_path': str(tmp_path / 'a.wav'),
                         'voice_ref_audio': reference})
     assert _terminal(frames)['type'] == 'result'
-    assert 'prompt_text' not in fake.calls[0][1]
+    assert fake.calls[0][1]['reference_text'] is None
 
 
 def test_clone_without_any_clip_is_refused(run, tmp_path):
@@ -88,9 +87,8 @@ def test_described_voice_makes_its_anchor_once_per_speaker(run, tmp_path):
     assert anchor_text == f'({description}){voices.ANCHORS["pt"]}'
     assert anchor_kwargs['seed'] == 11
     assert line_text == 'Bom dia'
-    assert line_kwargs['prompt_text'] == voices.ANCHORS['pt']
-    assert line_kwargs['prompt_wav'] == line_kwargs['reference_wav']
-    assert Path(line_kwargs['reference_wav']).is_file()
+    assert line_kwargs['reference_text'] == voices.ANCHORS['pt']
+    assert Path(line_kwargs['reference']).is_file()
 
     frames, fake = run(dict(params, text='Boa noite'))
     assert _terminal(frames)['type'] == 'result'
@@ -108,7 +106,7 @@ def test_described_voice_in_a_language_without_an_anchor_clones_the_timbre_only(
     anchor_text = fake.calls[0][0]
     assert anchor_text.endswith(voices.ANCHORS['en'])
     line_kwargs = fake.calls[1][1]
-    assert 'prompt_text' not in line_kwargs and line_kwargs['reference_wav']
+    assert line_kwargs['reference_text'] is None and line_kwargs['reference']
 
 
 def test_the_voice_you_describe_reads_the_setting(run, tmp_path, monkeypatch):
