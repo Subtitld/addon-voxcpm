@@ -28,9 +28,10 @@ class FakeModel:
         self.loads = 0
         self.steps = 8
 
-    def load(self, path, threads=0):
+    def load(self, path, threads=0, backend='cpu'):
         self.loads += 1
-        return engine.Loaded(lib=None, registry=None, model=None, session=None, threads=threads or 4)
+        return engine.Loaded(lib=None, registry=None, model=None, session=None, threads=threads or 4,
+                             backend=backend)
 
     def synthesize(self, loaded, text, **kwargs):
         self.calls.append((text, kwargs))
@@ -51,6 +52,7 @@ def run(monkeypatch, tmp_path):
     monkeypatch.setattr(engine, 'weights_present', lambda folder: True)
     monkeypatch.setattr(engine, 'load', fake.load)
     monkeypatch.setattr(engine, 'synthesize', fake.synthesize)
+    monkeypatch.setattr(engine, 'choose_backend', lambda path: 'cpu')
     monkeypatch.setenv('SUBTITLD_MODELS_DIR', str(tmp_path / 'models'))
     monkeypatch.setenv('SUBTITLD_TEMP_DIR', str(tmp_path))
     for name in ('VOXCPM_VOICE_DESCRIPTION', 'VOXCPM_VOICE_REF_AUDIO', 'VOXCPM_VOICE_REF_TEXT',

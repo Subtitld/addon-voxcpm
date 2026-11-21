@@ -45,7 +45,8 @@ language from the text.
 - **Time:** VoxCPM2 has 2.4B parameters, and on a CPU each second of speech
   takes several seconds to make: about 4.5 seconds on an otherwise idle Intel
   Core i7-13700T (8 performance cores) with the defaults. *Quality steps* at 5 is
-  faster, with audibly less clarity. The add-on runs on the CPU.
+  faster, with audibly less clarity. The add-on runs on the CPU, or on the GPU
+  of an Apple Silicon Mac.
 
 After the download nothing leaves the machine.
 
@@ -69,7 +70,9 @@ with only VoxCPM2 compiled in, and applies one patch,
 `tools/patches/audiocpp-step-callback.patch`: a callback before each generated
 step, so a line reports its progress and stops between two steps when it is
 cancelled. Upstream's C API runs a line to its end. ggml picks the build for
-the processor it runs on, from SSE4.2 to AVX-512.
+the processor it runs on, from SSE4.2 to AVX-512. On an Apple Silicon Mac it
+runs on the GPU (Metal), once a short test line in a separate process has
+shown that works there; `VOXCPM_DEVICE=cpu` or `metal` skips the test.
 
 The model is VoxCPM2 with its weights in 8-bit (Q8_0), as audio.cpp's project
 converted it: 2.96 GB, against 4.96 GB for the original bfloat16 checkpoint.
@@ -105,8 +108,7 @@ dist/voxcpm-addon/voxcpm-addon --self-test
 The release workflow builds, proves and publishes every platform on a tag
 `v<version>` matching `manifest.json`; a manual run can build only some
 platforms (`targets`). `tools/assemble_licences.py` fails the build when a
-native file in the bundle has no notice. macOS and Windows builds of
-audio.cpp are not set up yet.
+native file in the bundle has no notice.
 
 ## Licence
 

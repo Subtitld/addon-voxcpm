@@ -278,12 +278,21 @@ def _load_model(state: '_Request', options: dict) -> engine.Loaded:
     for path in engine.retire_torch_weights():
         log.info('removed %s, which earlier versions of the add-on downloaded', path)
     _emit_progress(state.req_id, 0.2, 'Loading VoxCPM2...')
+    path = folder / engine.MODEL_FILE
+    backend = engine.choose_backend(path)
     started = time.monotonic()
     try:
-        _loaded = engine.load(folder / engine.MODEL_FILE, options['threads'])
+        try:
+            _loaded = engine.load(path, options['threads'], backend)
+        except engine.EngineError as exc:
+            if backend == 'cpu':
+                raise
+            log.warning('VoxCPM2 did not load on %s (%s); using the CPU', backend, exc)
+            _loaded = engine.load(path, options['threads'], 'cpu')
     except engine.EngineError as exc:
         raise _AddonError(ERR_INTERNAL, f'VoxCPM2 could not be loaded: {exc}') from exc
-    log.info('VoxCPM2 loaded in %.1fs, %d threads%s', time.monotonic() - started, _loaded.threads,
+    log.info('VoxCPM2 loaded in %.1fs on the %s, %d threads%s', time.monotonic() - started,
+             'GPU (Metal)' if _loaded.backend == 'metal' else 'CPU', _loaded.threads,
              f' on CPUs {_loaded.cpus[0]}-{_loaded.cpus[-1]} (the performance cores)' if _loaded.cpus else '')
     return _loaded
 
@@ -596,6 +605,7 @@ def _self_test() -> int:
         'families': families,
         'threads': engine.default_threads(),
         'performance_cpus': engine.performance_cpus(),
+        'apple_silicon': engine.apple_silicon(),
         'frames': frames,
         'openssl': ssl.OPENSSL_VERSION,
     }
@@ -615,6 +625,11 @@ def main() -> int:
     tls.configure_ca_bundle()
     if '--self-test' in sys.argv[1:]:
         return _self_test()
+    if '--probe-metal' in sys.argv[1:]:
+        # engine.metal_works() runs this in a child: Metal may crash the process.
+        engine.probe_metal(Path(sys.argv[sys.argv.index('--probe-metal') + 1]))
+        print('metal works', file=sys.__stdout__, flush=True)
+        return 0
     _claim_protocol_stdio()
     log.info('voxcpm-addon %s on %s %s, python %s',
              ADDON_VERSION, platform.system(), platform.machine(), platform.python_version())

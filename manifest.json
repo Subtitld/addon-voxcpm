@@ -19,6 +19,9 @@
     "tts.synthesize"
   ],
   "compute": "cpu",
+  "accelerators": [
+    "mps"
+  ],
   "voice_clone": true,
   "languages": [
     "ar",

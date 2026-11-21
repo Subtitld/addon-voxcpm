@@ -13,7 +13,7 @@ import sys
 import wave
 from pathlib import Path
 
-from voxcpm_addon import voices
+from voxcpm_addon import engine, voices
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -165,3 +165,20 @@ def test_the_process_says_hello_and_leaves_on_shutdown():
     assert {v['id'] for v in capability['voices']} == set(voices.BY_ID)
     assert error == {'id': 'x', 'type': 'error', 'code': 'bad_params',
                      'message': "unsupported frame type 'asr.transcribe'", 'retryable': False}
+
+
+def test_a_model_that_fails_on_metal_loads_on_the_cpu(run, reference, tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, 'choose_backend', lambda path: 'metal')
+    backends = []
+
+    def load(path, threads=0, backend='cpu'):
+        backends.append(backend)
+        if backend == 'metal':
+            raise engine.EngineError('session: no Metal device')
+        return engine.Loaded(lib=None, registry=None, model=None, session=None, threads=4, backend=backend)
+
+    monkeypatch.setattr(engine, 'load', load)
+    frames, _fake = run({'text': 'Hi', 'voice': voices.CLONE, 'output_path': str(tmp_path / 'a.wav'),
+                         'voice_ref_audio': reference})
+    assert _terminal(frames)['type'] == 'result'
+    assert backends == ['metal', 'cpu']

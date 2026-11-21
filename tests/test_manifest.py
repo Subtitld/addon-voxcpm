@@ -83,7 +83,7 @@ def test_cpu_lists_parse():
 
 
 def test_the_settings_are_the_ones_this_runtime_has():
-    # Device and precision went with PyTorch: audio.cpp runs the Q8 model on the CPU.
+    # Device and precision went with PyTorch; Metal is chosen by a check, not a setting.
     assert 'device' not in FIELDS and 'precision' not in FIELDS
-    assert MANIFEST['compute'] == 'cpu'
+    assert MANIFEST['compute'] == 'cpu' and MANIFEST['accelerators'] == ['mps']
     assert MANIFEST['ram_required_mb'] >= 4500

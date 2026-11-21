@@ -7,10 +7,13 @@ The add-on calls audio.cpp's C ABI (include/audiocpp.h) through ctypes. This
 script checks out 0xShug0/audio.cpp at a pinned commit, builds its C library
 with only the VoxCPM2 family compiled in, and collects:
 
-- build/assets/audiocpp/: the C library and ggml (libaudiocpp.so.0,
-  libggml.so.0, libggml-base.so.0 on Linux), and one ggml CPU backend per
-  x86-64 instruction set (libggml-cpu-*.so), of which ggml loads the best the
-  processor runs. Each library finds the others in its own folder.
+- build/assets/audiocpp/: the C library. On Linux and Windows, ggml beside it
+  (libggml.so.0 and libggml-base.so.0; ggml.dll and ggml-base.dll) and one
+  ggml CPU backend per x86-64 instruction set (libggml-cpu-*.so,
+  ggml-cpu-*.dll), of which ggml loads the best the processor runs; each
+  library finds the others in its own folder. On macOS one library,
+  libaudiocpp.0.dylib, with ggml, its CPU backend for Apple Silicon and its
+  Metal backend (the shaders embedded) linked in.
 - build/assets/audiocpp/audiocpp.h: the header the ctypes bindings follow.
 - build/assets/native.json: where it all came from, and each file's SHA-256.
 - build/licences/audiocpp/: the licences of what the libraries compile in.
@@ -26,7 +29,10 @@ no data files travel with it. ggml runs on its own thread pool, without
 OpenMP: as fast as with it on an i7-13700T, and no libgomp to ship.
 
 Linux builds run in the AlmaLinux 8 container (tools/build_native_linux.sh),
-so the libraries load on glibc 2.28.
+so the libraries load on glibc 2.28. macOS builds are for Apple Silicon and
+macOS 13.3 or newer, like the other add-ons. Windows builds need Visual
+Studio's C++ tools, and link Microsoft's C runtime statically, so no
+runtime DLL has to be on the user's machine.
 
     python tools/build_native.py [--jobs N]
 """
@@ -65,6 +71,15 @@ CMAKE_OPTIONS = [
     '-DGGML_OPENMP=OFF',
 ]
 LINUX_OPTIONS = ['-DENGINE_ENABLE_CPU_ALL_VARIANTS=ON']
+WINDOWS_OPTIONS = ['-A', 'x64', '-DENGINE_ENABLE_CPU_ALL_VARIANTS=ON',
+                   '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded', '-DCMAKE_POLICY_DEFAULT_CMP0091=NEW']
+MACOS_OPTIONS = ['-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_OSX_ARCHITECTURES=arm64',
+                 '-DCMAKE_OSX_DEPLOYMENT_TARGET=13.3', '-DENGINE_ENABLE_METAL=ON',
+                 '-DGGML_METAL_EMBED_LIBRARY=ON']
+MACOS_MIN = (13, 3)
+
+# The file the add-on loads, by platform.
+ENTRY = {'linux': 'libaudiocpp.so.0', 'macos': 'libaudiocpp.0.dylib', 'windows': 'audiocpp.dll'}
 
 # The library files to ship, by the name they are loaded under (their SONAME).
 LINUX_LIBRARIES = {
@@ -145,22 +160,57 @@ def checkout():
 
 def build(platform, jobs):
     configure = ['cmake', '-S', SRC, '-B', NATIVE_BUILD, *CMAKE_OPTIONS]
-    if platform == 'linux':
-        configure += ['-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release', *LINUX_OPTIONS]
-    else:
-        sys.exit(f'FATAL: {platform} builds are not set up yet')
+    configure += {'linux': ['-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release', *LINUX_OPTIONS],
+                  'windows': WINDOWS_OPTIONS, 'macos': MACOS_OPTIONS}[platform]
     run(configure)
     run(['cmake', '--build', NATIVE_BUILD, '--config', 'Release', '--parallel', str(jobs), '--target', 'audiocpp'])
-    return NATIVE_BUILD / 'bin'
+    return NATIVE_BUILD
+
+
+def built_files(built, pattern):
+    """Files under the build tree matching `pattern`, outside CMake's own folders."""
+    return sorted(p for p in built.rglob(pattern)
+                  if p.is_file() and not p.is_symlink() and 'CMakeFiles' not in p.parts)
 
 
 def collect_linux(built):
+    built = built / 'bin'
     fresh(RUNTIME)
     for name, real in LINUX_LIBRARIES.items():
         if not (built / real).is_file():
             sys.exit(f'FATAL: the build made no {real} in {built}')
         shutil.copyfile(built / real, RUNTIME / name)
     variants = sorted(built.glob('libggml-cpu-*.so'))
+    if not variants:
+        sys.exit(f'FATAL: no ggml CPU backends in {built}')
+    for variant in variants:
+        shutil.copyfile(variant, RUNTIME / variant.name)
+    shutil.copyfile(SRC / 'include' / 'audiocpp.h', RUNTIME / 'audiocpp.h')
+
+
+def collect_macos(built):
+    """libaudiocpp.0.dylib: ggml is linked in, so it is the only library."""
+    fresh(RUNTIME)
+    found = built_files(built, 'libaudiocpp*.dylib')
+    if len(found) != 1:
+        sys.exit(f'FATAL: expected one libaudiocpp dylib in {built}, found {[str(p) for p in found]}')
+    shutil.copyfile(found[0], RUNTIME / ENTRY['macos'])
+    stray = built_files(built, 'libggml*.dylib')
+    if stray:
+        sys.exit(f'FATAL: ggml was built as separate libraries ({stray[0].name}); it should be linked in')
+    shutil.copyfile(SRC / 'include' / 'audiocpp.h', RUNTIME / 'audiocpp.h')
+
+
+def collect_windows(built):
+    """audiocpp.dll, ggml.dll, ggml-base.dll and the ggml-cpu-*.dll backends."""
+    fresh(RUNTIME)
+    names = ['audiocpp.dll', 'ggml.dll', 'ggml-base.dll']
+    for name in names:
+        found = built_files(built, name)
+        if len(found) != 1:
+            sys.exit(f'FATAL: expected one {name} in {built}, found {[str(p) for p in found]}')
+        shutil.copyfile(found[0], RUNTIME / name)
+    variants = built_files(built, 'ggml-cpu-*.dll')
     if not variants:
         sys.exit(f'FATAL: no ggml CPU backends in {built}')
     for variant in variants:
@@ -213,12 +263,79 @@ def check_linux():
     print('the libraries load on glibc 2.28 with the GCC 8 runtime, from one folder; libaudiocpp exports only audiocpp_*')
 
 
-def check_vendored():
-    """Which third-party code is compiled in, from the library's own symbols."""
-    symbols = output(['nm', '-C', RUNTIME / 'libaudiocpp.so.0'])
+# ---- macOS: refuse anything a Mac with macOS 13.3 couldn't load -----------
+
+def check_macos():
+    lib = RUNTIME / ENTRY['macos']
+    problems = []
+    for line in output(['otool', '-L', lib]).splitlines()[1:]:
+        dep = line.strip().split(' (', 1)[0]
+        if dep.startswith(('/usr/lib/', '/System/Library/')) or dep.endswith('/' + ENTRY['macos']):
+            continue
+        problems.append(f'{lib.name} needs {dep}, which is neither shipped nor part of macOS')
+    minos = re.findall(r'^\s*minos (\d+)\.(\d+)', output(['otool', '-l', lib]), re.M)
+    if not minos:
+        problems.append(f'{lib.name} carries no minimum macOS version')
+    for major, minor in minos:
+        if (int(major), int(minor)) > MACOS_MIN:
+            problems.append(f'{lib.name} needs macOS {major}.{minor}')
+    exported = [line.split()[-1] for line in output(['nm', '-gU', lib]).splitlines()
+                if line.split() and not line.split()[-1].startswith('_audiocpp_')]
+    if exported:
+        problems.append(f'{lib.name} exports more than audiocpp_*: {exported[:5]}')
+    if 'arm64' not in output(['lipo', '-archs', lib]):
+        problems.append(f'{lib.name} is not built for Apple Silicon')
+    if problems:
+        sys.exit('not loadable on macOS 13.3:\n  ' + '\n  '.join(problems))
+    print(f'{lib.name} loads on macOS {MACOS_MIN[0]}.{MACOS_MIN[1]} and newer, on Apple Silicon; it exports only audiocpp_*')
+
+
+# ---- Windows: only system DLLs, no C runtime DLL --------------------------
+
+def _pe_imports(path):
+    import pefile  # PyInstaller's own dependency on Windows
+    pe = pefile.PE(str(path), fast_load=True)
+    pe.parse_data_directories([pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IMPORT']])
+    return [entry.dll.decode() for entry in getattr(pe, 'DIRECTORY_ENTRY_IMPORT', [])]
+
+
+def check_windows():
+    shipped = {p.name.lower() for p in RUNTIME.glob('*.dll')}
+    problems = []
+    for lib in sorted(RUNTIME.glob('*.dll')):
+        for dep in _pe_imports(lib):
+            low = dep.lower()
+            if low in shipped:
+                continue
+            if re.match(r'(msvcp|vcruntime|vcomp|concrt)\d+', low) or low.startswith('api-ms-win-crt-'):
+                problems.append(f'{lib.name} needs {dep}: the C runtime should be linked in statically')
+            elif not (low.startswith('api-ms-win-') or low in WINDOWS_SYSTEM):
+                problems.append(f'{lib.name} needs {dep}, which is neither shipped nor a system DLL')
+    if problems:
+        sys.exit('not loadable on a bare Windows:\n  ' + '\n  '.join(sorted(set(problems))))
+    print('the DLLs need only Windows system DLLs, and find each other in their own folder')
+
+
+WINDOWS_SYSTEM = {'kernel32.dll', 'user32.dll', 'advapi32.dll', 'shell32.dll', 'ole32.dll', 'oleaut32.dll',
+                  'ws2_32.dll', 'bcrypt.dll', 'ntdll.dll', 'shlwapi.dll', 'dbghelp.dll', 'psapi.dll',
+                  'version.dll', 'winmm.dll', 'crypt32.dll', 'secur32.dll', 'userenv.dll'}
+
+
+def check_vendored(platform):
+    """Which third-party code is compiled in, from the library's own symbols.
+
+    A DLL keeps no symbols but its exports, so on Windows every library in
+    VENDORED is taken as present; the Linux and macOS builds check the same
+    sources.
+    """
+    if platform == 'windows':
+        present = list(VENDORED)
+        print('compiled in (not checked on Windows):', ', '.join(['audio.cpp', *present]))
+        return present
+    symbols = output(['nm', '-C', RUNTIME / ENTRY[platform]])
     found = [name for name, pattern in UNEXPECTED.items() if re.search(pattern, symbols)]
     if found:
-        sys.exit(f'FATAL: libaudiocpp.so.0 now compiles in {", ".join(found)}: add its licence to VENDORED')
+        sys.exit(f'FATAL: {ENTRY[platform]} now compiles in {", ".join(found)}: add its licence to VENDORED')
     present = [name for name, (pattern, _files) in VENDORED.items() if pattern is None or re.search(pattern, symbols)]
     print('compiled in:', ', '.join(['audio.cpp', *present]))
     return present
@@ -246,14 +363,14 @@ def main():
 
     checkout()
     built = build(host, args.jobs)
-    collect_linux(built)
-    check_linux()
-    collect_licences(check_vendored())
+    {'linux': collect_linux, 'macos': collect_macos, 'windows': collect_windows}[host](built)
+    {'linux': check_linux, 'macos': check_macos, 'windows': check_windows}[host]()
+    collect_licences(check_vendored(host))
 
     files = {p.relative_to(ASSETS).as_posix(): sha256(p) for p in sorted(ASSETS.rglob('*')) if p.is_file()}
     record = {'runtime': f'audio.cpp {VERSION} C API, VoxCPM2 only', 'repo': REPO, 'commit': COMMIT,
               'patches': {p.name: sha256(p) for p in PATCHES},
-              'platform': host, 'entry': 'audiocpp/libaudiocpp.so.0', 'files': files}
+              'platform': host, 'entry': f'audiocpp/{ENTRY[host]}', 'files': files}
     (ASSETS / 'native.json').write_text(json.dumps(record, indent=1) + '\n')
     size = sum(p.stat().st_size for p in RUNTIME.iterdir()) / 2**20
     print(f'{len(files)} files in {ASSETS}, {size:.1f} MiB of runtime')

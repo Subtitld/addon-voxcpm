@@ -24,6 +24,13 @@ $VOXCPM_MODEL_DIR at a folder that already holds the file, which is then used
 as it is. The PyTorch weights earlier versions downloaded (4.96 GB) are
 removed once the new file checks out.
 
+Metal
+-----
+On Apple Silicon, synthesis runs on the GPU through ggml's Metal backend,
+once a check in a child process has shown it works there (see metal_works);
+elsewhere, and when it does not, on the CPU. $VOXCPM_DEVICE=cpu or metal
+skips the check.
+
 Threads
 -------
 On a CPU with performance and efficiency cores, the slower cores hold every
@@ -35,12 +42,16 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import json
 import logging
 import os
+import platform
 import shutil
 import ssl
 import subprocess
 import sys
+import threading
+import time
 import urllib.error
 import urllib.request
 from array import array
@@ -482,10 +493,11 @@ class Loaded:
     session: ctypes.c_void_p
     threads: int
     cpus: list[int] = field(default_factory=list)
+    backend: str = 'cpu'
 
 
-def load(path: Path, threads: int = 0) -> Loaded:
-    """VoxCPM2 from the GGUF file at `path`, in a CPU session."""
+def load(path: Path, threads: int = 0, backend: str = 'cpu') -> Loaded:
+    """VoxCPM2 from the GGUF file at `path`, in a session on `backend` ('cpu' or 'metal')."""
     lib = load_library()
     cpus = keep_to_performance_cores()
     threads = threads if threads > 0 else default_threads()
@@ -499,7 +511,7 @@ def load(path: Path, threads: int = 0) -> Loaded:
         _check(lib, lib.audiocpp_options_set(options, b'voxcpm2.prompt_cache_slots',
                                              str(PROMPT_CACHE_SLOTS).encode()), 'session options')
         _check(lib, lib.audiocpp_session_create(model, b'tts', b'offline',
-                                                ctypes.byref(_BackendConfig(b'cpu', 0, threads)),
+                                                ctypes.byref(_BackendConfig(backend.encode(), 0, threads)),
                                                 options, ctypes.byref(session)), 'session')
     except BaseException:
         lib.audiocpp_session_free(session)
@@ -508,7 +520,8 @@ def load(path: Path, threads: int = 0) -> Loaded:
         raise
     finally:
         lib.audiocpp_options_free(options)
-    return Loaded(lib=lib, registry=registry, model=model, session=session, threads=threads, cpus=cpus)
+    return Loaded(lib=lib, registry=registry, model=model, session=session, threads=threads, cpus=cpus,
+                  backend=backend)
 
 
 def close(loaded: Loaded) -> None:
@@ -580,3 +593,81 @@ def synthesize(loaded: Loaded, text: str, *, reference: str | None = None,
     finally:
         lib.audiocpp_result_free(result)
         lib.audiocpp_request_free(request)
+
+
+# ---------------------------------------------------------------------------
+# Metal, on Apple Silicon: tried once in a child process
+# ---------------------------------------------------------------------------
+# Where Metal is not up to it (the paravirtual GPU of a macOS virtual machine,
+# at least), the first graph run on it can kill the process with a
+# segmentation fault, which nothing in-process can catch. So before the
+# add-on uses Metal, it speaks one short line on it in a child process
+# (`--probe-metal`), and uses the CPU when the child does not come back with
+# an answer. The verdict is kept in the model cache, per runtime and macOS
+# version, so this happens once.
+PROBE_TIMEOUT_SEC = 600  # loading compiles Metal's shaders; the line itself is short
+_probe_lock = threading.Lock()
+
+
+def apple_silicon() -> bool:
+    return sys.platform == 'darwin' and platform.machine() == 'arm64'
+
+
+def _verdict_file() -> Path:
+    return cache_root() / 'metal-check.json'
+
+
+def _probe_command(path: Path) -> list[str]:
+    if getattr(sys, 'frozen', False):
+        return [sys.executable, '--probe-metal', str(path)]
+    return [sys.executable, '-m', 'voxcpm_addon', '--probe-metal', str(path)]
+
+
+def metal_works(path: Path) -> bool:
+    """Whether VoxCPM2 runs on Metal here; checked once, in a child process."""
+    with _probe_lock:
+        key = f'{runtime_version()} on macOS {platform.mac_ver()[0]}'
+        verdicts = _verdict_file()
+        try:
+            saved = json.loads(verdicts.read_text(encoding='utf-8'))
+            if saved.get('runtime') == key and isinstance(saved.get('voxcpm2'), bool):
+                return saved['voxcpm2']
+        except (OSError, ValueError, AttributeError):
+            pass
+        started = time.monotonic()
+        try:
+            done = subprocess.run(_probe_command(path), stdin=subprocess.DEVNULL, capture_output=True,
+                                  timeout=PROBE_TIMEOUT_SEC)
+            works = done.returncode == 0 and b'metal works' in done.stdout
+            detail = f'exit {done.returncode}'
+        except (OSError, subprocess.SubprocessError) as exc:
+            works, detail = False, str(exc)
+        log.info('Metal: %s (%s, %.1fs)', 'works' if works else 'fails; using the CPU', detail,
+                 time.monotonic() - started)
+        try:
+            verdicts.parent.mkdir(parents=True, exist_ok=True)
+            verdicts.write_text(json.dumps({'runtime': key, 'voxcpm2': works}) + '\n', encoding='utf-8')
+        except OSError as exc:
+            log.warning('could not save the Metal check: %s', exc)
+        return works
+
+
+def probe_metal(path: Path) -> None:
+    """The child's side of metal_works(): one short line on the GPU. A crash is the answer too."""
+    loaded = load(path, threads=default_threads(), backend='metal')
+    try:
+        samples, rate = synthesize(loaded, 'Hello there.', steps=4, seed=1)
+        if len(samples) < rate // 4:
+            raise EngineError(f'Metal made {len(samples)} samples of speech')
+    finally:
+        close(loaded)
+
+
+def choose_backend(path: Path) -> str:
+    """'metal' on Apple Silicon when it works there (or $VOXCPM_DEVICE says so), else 'cpu'."""
+    device = (os.environ.get('VOXCPM_DEVICE') or '').strip().lower()
+    if device == 'cpu' or not apple_silicon():
+        return 'cpu'
+    if device in ('metal', 'gpu', 'mps') or metal_works(path):
+        return 'metal'
+    return 'cpu'

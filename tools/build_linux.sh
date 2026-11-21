@@ -55,7 +55,8 @@ docker run --rm \
         # CMake and Ninja come from /opt/build-tools, still on PATH.
         python tools/build_native.py $*
         python -m pytest -q -p no:cacheprovider -m 'not weights' \\
-            tests/test_engine.py tests/test_audio.py tests/test_manifest.py tests/test_protocol.py tests/test_download.py
+            tests/test_engine.py tests/test_audio.py tests/test_manifest.py tests/test_protocol.py tests/test_download.py \\
+            tests/test_metal.py
 
         # /tmp/.cache belongs to root here, made by the pip mount.
         PYINSTALLER_CONFIG_DIR=/tmp/pyinstaller-config \\
