@@ -44,7 +44,7 @@ AUDIOCPP_LICENCES = REPO_ROOT / 'build' / 'licences' / 'audiocpp'
 # (pattern on the lower-cased file name, notice inside THIRD_PARTY_LICENSES/, component)
 RULES = [
     (r'^voxcpm-addon(\.exe)?$', 'pyinstaller/COPYING.txt', 'PyInstaller bootloader'),
-    (r'^(lib)?audiocpp[\d.]*\.(so|dylib|dll)', 'audiocpp/LICENSE', 'audio.cpp'),
+    (r'^(lib)?audiocpp[\d.]*\.(so|dylib|dll)', 'audiocpp/LICENSE', 'audio.cpp'),  # with ggml linked in on macOS
     (r'^(lib)?ggml(-base|-cpu-[\w]+)?[\d.]*\.(so|dylib|dll)', 'audiocpp/third_party/ggml/LICENSE', 'ggml'),
     (r'^(libpython3[\d.]*\.(so|dylib)[\d.]*|python3\d*\.dll|python)$', 'python/LICENSE.txt', 'CPython'),
     (r'(\.cpython-[^/]+\.(so|dylib)|\.pyd)$', 'python/LICENSE.txt', 'CPython extension module'),
@@ -146,10 +146,11 @@ def assemble(bundle: Path, out: Path) -> list[tuple[str, str, str]]:
             problems.append(f'{relative}: {component} needs THIRD_PARTY_LICENSES/{notice}, which is not committed')
             continue
         rows.append((relative, component, notice))
-    for component in ('audio.cpp', 'ggml'):
-        if not any(row[1] == component for row in rows):
-            problems.append(f'the bundle has no {component}')
-    required = ['audiocpp/audiocpp-step-callback.patch', 'audiocpp/third_party/cJSON/LICENSE',
+    # On macOS ggml is linked into libaudiocpp; elsewhere it is beside it.
+    if not any(row[1] == 'audio.cpp' for row in rows):
+        problems.append('the bundle has no audio.cpp')
+    required = ['audiocpp/audiocpp-step-callback.patch', 'audiocpp/third_party/ggml/LICENSE',
+                'audiocpp/third_party/cJSON/LICENSE',
                 'audiocpp/third_party/libyaml/License', 'models/README.md', 'models/Apache-2.0.txt']
     if sys.platform.startswith('linux'):
         # Parts of libstdc++ and libgcc are linked into audio.cpp's libraries.

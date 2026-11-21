@@ -1,0 +1,2 @@
+# Applied with git apply: CRLF on a Windows checkout would break them.
+tools/patches/*.patch -text

@@ -96,22 +96,22 @@ LINUX_SYSTEM = {
 # The newest symbol version each AlmaLinux 8 (glibc 2.28, GCC 8) library provides.
 LINUX_CEILINGS = {'GLIBC': (2, 28), 'GLIBCXX': (3, 4, 25), 'CXXABI': (1, 3, 11), 'GCC': (8, 0, 0)}
 
-# Third-party code the libraries may compile in: a symbol that marks it, and
-# its licence files in the audio.cpp tree. A vendored library whose symbols show
-# up without an entry here stops the build (see check_vendored).
+# Third-party code the libraries compile in, and its licence files in the
+# audio.cpp tree. Code from anything in UNEXPECTED stops the build (see
+# check_vendored) until it has an entry here.
 VENDORED = {
-    'ggml': (None, ['external/ggml/LICENSE']),
-    'cJSON': (r'\bcJSON_', ['external/cJSON/LICENSE']),
-    'libyaml': (r'\byaml_', ['external/libyaml/License']),
+    'ggml': ['external/ggml/LICENSE'],
+    'cJSON': ['external/cJSON/LICENSE'],
+    'libyaml': ['external/libyaml/License'],
 }
 UNEXPECTED = {
     'sentencepiece': r'sentencepiece::',
     'protobuf-lite': r'google::protobuf::',
-    'utf8proc': r'\butf8proc_',
-    'lz4': r'\bLZ4_',
+    'utf8proc': r'\b_?utf8proc_',
+    'lz4': r'\b_?LZ4_',
     'cpp-httplib': r'httplib::',
-    'llama tokenizer': r'\b(unicode_cpt|llm_tokenizer)',
-    'eSpeak NG (GPL)': r'\bespeak_',
+    'llama tokenizer': r'\b_?(unicode_cpt|llm_tokenizer)',
+    'eSpeak NG (GPL)': r'\b_?espeak_',
 }
 
 
@@ -322,21 +322,19 @@ WINDOWS_SYSTEM = {'kernel32.dll', 'user32.dll', 'advapi32.dll', 'shell32.dll', '
 
 
 def check_vendored(platform):
-    """Which third-party code is compiled in, from the library's own symbols.
+    """Refuse third-party code the licences do not cover, found by its symbols.
 
-    A DLL keeps no symbols but its exports, so on Windows every library in
-    VENDORED is taken as present; the Linux and macOS builds check the same
-    sources.
+    Every library in VENDORED is compiled in from the same sources on each
+    platform, so each one's licence ships everywhere. A DLL keeps no symbols
+    but its exports, so the scan for code new to the build runs on Linux and
+    macOS (where names carry a leading underscore).
     """
-    if platform == 'windows':
-        present = list(VENDORED)
-        print('compiled in (not checked on Windows):', ', '.join(['audio.cpp', *present]))
-        return present
-    symbols = output(['nm', '-C', RUNTIME / ENTRY[platform]])
-    found = [name for name, pattern in UNEXPECTED.items() if re.search(pattern, symbols)]
-    if found:
-        sys.exit(f'FATAL: {ENTRY[platform]} now compiles in {", ".join(found)}: add its licence to VENDORED')
-    present = [name for name, (pattern, _files) in VENDORED.items() if pattern is None or re.search(pattern, symbols)]
+    if platform != 'windows':
+        symbols = output(['nm', '-C', RUNTIME / ENTRY[platform]])
+        found = [name for name, pattern in UNEXPECTED.items() if re.search(pattern, symbols)]
+        if found:
+            sys.exit(f'FATAL: {ENTRY[platform]} now compiles in {", ".join(found)}: add its licence to VENDORED')
+    present = list(VENDORED)
     print('compiled in:', ', '.join(['audio.cpp', *present]))
     return present
 
@@ -351,7 +349,7 @@ def collect_licences(present):
     for name in present:
         folder = LICENCES / 'third_party' / name
         folder.mkdir(parents=True)
-        for relative in VENDORED[name][1]:
+        for relative in VENDORED[name]:
             shutil.copyfile(SRC / relative, folder / Path(relative).name)
 
 
