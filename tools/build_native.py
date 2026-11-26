@@ -32,7 +32,9 @@ Linux builds run in the AlmaLinux 8 container (tools/build_native_linux.sh),
 so the libraries load on glibc 2.28. macOS builds are for Apple Silicon and
 macOS 13.3 or newer, like the other add-ons. Windows builds need Visual
 Studio's C++ tools, and link Microsoft's C runtime statically, so no
-runtime DLL has to be on the user's machine.
+runtime DLL has to be on the user's machine. Haiku builds run on Haiku,
+against the system's libroot and libstdc++ (on every install), with the same
+libraries as on Linux; tools/patches/haiku/ holds what audio.cpp needs there.
 
     python tools/build_native.py [--jobs N]
 """
@@ -79,7 +81,8 @@ MACOS_OPTIONS = ['-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_OSX_ARCHITECTURES=arm64'
 MACOS_MIN = (13, 3)
 
 # The file the add-on loads, by platform.
-ENTRY = {'linux': 'libaudiocpp.so.0', 'macos': 'libaudiocpp.0.dylib', 'windows': 'audiocpp.dll'}
+ENTRY = {'linux': 'libaudiocpp.so.0', 'macos': 'libaudiocpp.0.dylib', 'windows': 'audiocpp.dll',
+         'haiku': 'libaudiocpp.so.0'}
 
 # The library files to ship, by the name they are loaded under (their SONAME).
 LINUX_LIBRARIES = {
@@ -93,6 +96,9 @@ LINUX_SYSTEM = {
     'libc.so.6', 'libm.so.6', 'libdl.so.2', 'libpthread.so.0', 'librt.so.1',
     'ld-linux-x86-64.so.2', 'libstdc++.so.6', 'libgcc_s.so.1',
 }
+# Haiku: libroot is its C library; libstdc++ and libgcc_s come with every
+# install (gcc_syslibs), and libnetwork holds the sockets.
+HAIKU_SYSTEM = {'libroot.so', 'libstdc++.so.6', 'libgcc_s.so.1', 'libnetwork.so', 'libbsd.so'}
 # The newest symbol version each AlmaLinux 8 (glibc 2.28, GCC 8) library provides.
 LINUX_CEILINGS = {'GLIBC': (2, 28), 'GLIBCXX': (3, 4, 25), 'CXXABI': (1, 3, 11), 'GCC': (8, 0, 0)}
 
@@ -143,6 +149,11 @@ def fresh(path):
 GIT = ['git', '-c', 'core.autocrlf=false', '-c', 'core.eol=lf']
 
 
+def platform_patches(platform):
+    """tools/patches/<platform>/*.patch, in order: what audio.cpp needs to build there."""
+    return sorted((ROOT / 'tools' / 'patches' / platform).glob('*.patch'))
+
+
 def checkout():
     """The pinned commit, shallow, with PATCHES applied. Its one submodule (web front ends) isn't needed."""
     if not (SRC / '.git').exists():
@@ -161,6 +172,7 @@ def checkout():
 def build(platform, jobs):
     configure = ['cmake', '-S', SRC, '-B', NATIVE_BUILD, *CMAKE_OPTIONS]
     configure += {'linux': ['-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release', *LINUX_OPTIONS],
+                  'haiku': ['-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release', *LINUX_OPTIONS],
                   'windows': WINDOWS_OPTIONS, 'macos': MACOS_OPTIONS}[platform]
     run(configure)
     run(['cmake', '--build', NATIVE_BUILD, '--config', 'Release', '--parallel', str(jobs), '--target', 'audiocpp'])
@@ -263,6 +275,23 @@ def check_linux():
     print('the libraries load on glibc 2.28 with the GCC 8 runtime, from one folder; libaudiocpp exports only audiocpp_*')
 
 
+# ---- Haiku: only the system's libraries, and each other from one folder ---
+
+def check_haiku():
+    shipped = {p.name for p in RUNTIME.glob('*.so*')}
+    problems = []
+    for lib in sorted(RUNTIME.glob('*.so*')):
+        problems += [f'{lib.name} needs {dep}, which is neither shipped nor a system library'
+                     for dep in needed(lib) if dep not in HAIKU_SYSTEM | shipped]
+        runpath = re.findall(r'\((?:RUNPATH|RPATH)\)\s+Library (?:runpath|rpath): \[([^\]]+)\]',
+                             output(['readelf', '-d', lib]))
+        if runpath != ['$ORIGIN']:
+            problems.append(f'{lib.name} has runpath {runpath}, not $ORIGIN')
+    if problems:
+        sys.exit('not loadable on Haiku:\n  ' + '\n  '.join(sorted(set(problems))))
+    print('the libraries need only Haiku system libraries, and find each other in their own folder')
+
+
 # ---- macOS: refuse anything a Mac with macOS 13.3 couldn't load -----------
 
 def check_macos():
@@ -354,15 +383,17 @@ def collect_licences(present):
 
 
 def main():
-    host = {'linux': 'linux', 'win32': 'windows', 'darwin': 'macos'}[sys.platform]
+    host = 'haiku' if sys.platform.startswith('haiku') else {'linux': 'linux', 'win32': 'windows',
+                                                               'darwin': 'macos'}[sys.platform]
     parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     parser.add_argument('--jobs', type=int, default=int(os.environ.get('JOBS', os.cpu_count() or 4)))
     args = parser.parse_args()
 
+    PATCHES.extend(platform_patches(host))
     checkout()
     built = build(host, args.jobs)
-    {'linux': collect_linux, 'macos': collect_macos, 'windows': collect_windows}[host](built)
-    {'linux': check_linux, 'macos': check_macos, 'windows': check_windows}[host]()
+    {'linux': collect_linux, 'haiku': collect_linux, 'macos': collect_macos, 'windows': collect_windows}[host](built)
+    {'linux': check_linux, 'macos': check_macos, 'windows': check_windows, 'haiku': check_haiku}[host]()
     collect_licences(check_vendored(host))
 
     files = {p.relative_to(ASSETS).as_posix(): sha256(p) for p in sorted(ASSETS.rglob('*')) if p.is_file()}

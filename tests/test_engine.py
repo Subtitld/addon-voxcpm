@@ -46,6 +46,15 @@ def test_threads():
     assert cpus == sorted(cpus)
 
 
+def test_haiku_sessions_reserve_small_contexts(monkeypatch):
+    monkeypatch.setattr(engine.sys, 'platform', 'linux')
+    assert engine.session_options() == {'voxcpm2.prompt_cache_slots': str(engine.PROMPT_CACHE_SLOTS)}
+    monkeypatch.setattr(engine.sys, 'platform', 'haiku1')
+    options = engine.session_options()
+    assert all(options[key] == str(engine.HAIKU_CONTEXT_MB) for key in engine.CONTEXT_OPTIONS)
+    assert options['voxcpm2.prompt_cache_slots'] == str(engine.PROMPT_CACHE_SLOTS)
+
+
 @pytest.fixture(scope='module')
 def loaded():
     model = engine.load(Path(MODEL))

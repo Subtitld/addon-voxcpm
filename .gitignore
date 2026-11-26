@@ -13,3 +13,4 @@ release-staging/
 .DS_Store
 report.xml
 frozen-report.xml
+release-staging-haiku/
