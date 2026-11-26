@@ -484,6 +484,26 @@ STEPS_PER_SECOND = 6.25
 # encoding its clip again. A dub alternates between a few speakers.
 PROMPT_CACHE_SLOTS = 8
 
+# audio.cpp's ggml contexts hold only tensor and graph metadata (under 3 MB
+# here), but VoxCPM2 reserves up to 3 GB for each by default: 5.6 GB in all,
+# never touched. Linux and macOS overcommit; Haiku doesn't, so there the
+# reservations alone used up its memory. 64 MB each leaves ample room.
+HAIKU_CONTEXT_MB = 64
+CONTEXT_OPTIONS = (
+    'voxcpm2.weight_context_mb', 'voxcpm2.text_embedding_graph_arena_mb', 'voxcpm2.lm_step_graph_arena_mb',
+    'voxcpm2.projection_graph_arena_mb', 'voxcpm2.local_encoder_graph_arena_mb', 'voxcpm2.dit_graph_arena_mb',
+    'voxcpm2.audiovae_weight_context_mb', 'voxcpm2.audiovae_graph_arena_mb',
+    'voxcpm2.audiovae_encoder_graph_arena_mb',
+)
+
+
+def session_options() -> dict[str, str]:
+    """audio.cpp session options for this platform."""
+    options = {'voxcpm2.prompt_cache_slots': str(PROMPT_CACHE_SLOTS)}
+    if sys.platform.startswith('haiku'):
+        options.update((key, str(HAIKU_CONTEXT_MB)) for key in CONTEXT_OPTIONS)
+    return options
+
 
 @dataclass
 class Loaded:
@@ -508,8 +528,8 @@ def load(path: Path, threads: int = 0, backend: str = 'cpu') -> Loaded:
         _check(lib, lib.audiocpp_model_load(registry, str(path).encode(),
                                             ctypes.byref(_ModelConfig(b'voxcpm2', None, None, None)),
                                             None, ctypes.byref(model)), 'loading VoxCPM2')
-        _check(lib, lib.audiocpp_options_set(options, b'voxcpm2.prompt_cache_slots',
-                                             str(PROMPT_CACHE_SLOTS).encode()), 'session options')
+        for key, value in session_options().items():
+            _check(lib, lib.audiocpp_options_set(options, key.encode(), value.encode()), 'session options')
         _check(lib, lib.audiocpp_session_create(model, b'tts', b'offline',
                                                 ctypes.byref(_BackendConfig(backend.encode(), 0, threads)),
                                                 options, ctypes.byref(session)), 'session')

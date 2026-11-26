@@ -110,6 +110,15 @@ The release workflow builds, proves and publishes every platform on a tag
 platforms (`targets`). `tools/assemble_licences.py` fails the build when a
 native file in the bundle has no notice.
 
+## Haiku
+
+audio.cpp is built on Haiku, so the Haiku archive is built on a Haiku machine and added to a release by hand. Haiku has no PyInstaller: the add-on runs on HaikuPorts' Python 3.14, and the archive carries audio.cpp where a run from source looks for it.
+
+```bash
+python3.14 tools/build_native.py
+python3.14 tools/build_haiku.py
+```
+
 ## Licence
 
 The add-on is Apache-2.0. audio.cpp is Apache-2.0, with ggml, cJSON and

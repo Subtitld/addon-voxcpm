@@ -1,0 +1,54 @@
+Without a threadpool the CPU backend starts and joins its threads for every
+graph, and on Haiku each thread started leaves about 4 KB behind in the
+process (4,000 rounds of 4 threads: 68 MB). VoxCPM2 grew by 4-5 MB per
+spoken line that way. On Haiku each CPU backend now gets one threadpool,
+made again only when its thread count changes.
+
+diff --git a/src/framework/core/backend.cpp b/src/framework/core/backend.cpp
+index aa130b9..c28a4b3 100644
+--- a/src/framework/core/backend.cpp
++++ b/src/framework/core/backend.cpp
+@@ -9,6 +9,10 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <memory>
++#if defined(__HAIKU__)
++#include <mutex>
++#include <unordered_map>
++#endif
+ #include <ostream>
+ #include <stdexcept>
+ #include <string>
+@@ -415,6 +419,32 @@ void set_backend_threads(ggml_backend_t backend, int threads) {
+     if (fn != nullptr) {
+         ((ggml_backend_set_n_threads_t)fn)(backend, threads);
+     }
++#if defined(__HAIKU__)
++    // Without a threadpool the CPU backend starts and joins its threads for
++    // every graph, and on Haiku each thread started leaves about 4 KB behind
++    // in the process: megabytes per spoken line. So each CPU backend gets
++    // one pool, made again only when its thread count changes. Pools are
++    // never freed: a backend's address can be reused after it is freed, and
++    // there are only a few.
++    using threadpool_new_t = ggml_threadpool_t (*)(ggml_threadpool_params *);
++    using set_threadpool_t = void (*)(ggml_backend_t, ggml_threadpool_t);
++    auto * make_pool = (threadpool_new_t) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new");
++    auto * set_pool = (set_threadpool_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
++    if (make_pool == nullptr || set_pool == nullptr || threads <= 0) {
++        return;
++    }
++    static std::mutex pools_mutex;
++    static std::unordered_map<ggml_backend_t, std::pair<int, ggml_threadpool_t>> pools;
++    std::lock_guard<std::mutex> lock(pools_mutex);
++    auto & entry = pools[backend];
++    if (entry.second == nullptr || entry.first != threads) {
++        ggml_threadpool_params params = ggml_threadpool_params_default(threads);
++        entry = {threads, make_pool(&params)};
++    }
++    if (entry.second != nullptr) {
++        set_pool(backend, entry.second);
++    }
++#endif
+ }
+ 
+ bool is_host_backend(ggml_backend_t backend) {

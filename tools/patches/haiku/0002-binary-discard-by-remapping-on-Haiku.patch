@@ -1,0 +1,102 @@
+Haiku accepts madvise(MADV_DONTNEED) but keeps the pages, so the model file's
+mapped pages stayed in memory after the loader copied each tensor out: a
+3 GB GGUF then held 6 GB at the end of loading. On Haiku the file stays open
+and discard_range unmaps the range and maps the file there again, which
+drops the pages; touching them later reads the file, as after
+MADV_DONTNEED on Linux. A single mmap(MAP_FIXED) over the old range never
+returns on Haiku, and a readable new mapping comes with about a quarter of
+the cached pages mapped in again, so it is mapped PROT_NONE and then made
+readable.
+
+diff --git a/include/engine/framework/io/binary.h b/include/engine/framework/io/binary.h
+index 4671564..835dc33 100644
+--- a/include/engine/framework/io/binary.h
++++ b/include/engine/framework/io/binary.h
+@@ -33,6 +33,8 @@ private:
+     std::vector<std::byte> owned_;
+     const std::byte * mapped_ = nullptr;
+     size_t size_ = 0;
++    // Kept open where discard_range remaps from the file (Haiku).
++    int fd_ = -1;
+ };
+ 
+ // require_mapping forbids an owned full-file copy when mapping is unavailable.
+diff --git a/src/framework/io/binary.cpp b/src/framework/io/binary.cpp
+index 305d604..10ed661 100644
+--- a/src/framework/io/binary.cpp
++++ b/src/framework/io/binary.cpp
+@@ -57,9 +57,11 @@ BinaryBlob::BinaryBlob(const std::byte * mapped, size_t size) noexcept
+ BinaryBlob::BinaryBlob(BinaryBlob && other) noexcept
+     : owned_(std::move(other.owned_)),
+       mapped_(other.mapped_),
+-      size_(other.size_) {
++      size_(other.size_),
++      fd_(other.fd_) {
+     other.mapped_ = nullptr;
+     other.size_ = 0;
++    other.fd_ = -1;
+ }
+ 
+ BinaryBlob & BinaryBlob::operator=(BinaryBlob && other) noexcept {
+@@ -70,8 +72,10 @@ BinaryBlob & BinaryBlob::operator=(BinaryBlob && other) noexcept {
+     owned_ = std::move(other.owned_);
+     mapped_ = other.mapped_;
+     size_ = other.size_;
++    fd_ = other.fd_;
+     other.mapped_ = nullptr;
+     other.size_ = 0;
++    other.fd_ = -1;
+     return *this;
+ }
+ 
+@@ -104,7 +108,19 @@ void BinaryBlob::discard_range(size_t offset, size_t size) const noexcept {
+     if (clamped_end > aligned_begin) {
+         void * address = const_cast<std::byte *>(mapped_) + static_cast<std::ptrdiff_t>(aligned_begin);
+         const size_t length = clamped_end - aligned_begin;
+-#if defined(MADV_DONTNEED)
++#if defined(__HAIKU__)
++        // Haiku accepts MADV_DONTNEED but keeps the pages, so a model whose
++        // weights were copied out stays in memory twice. Unmapping the range
++        // and mapping the file there again drops them; touching it again
++        // reads the file, as after MADV_DONTNEED on Linux. Mapping with
++        // MAP_FIXED straight over the old range hangs the caller on Haiku,
++        // and a readable new mapping comes with the cached pages mapped in
++        // again (about a quarter here), so it is made readable afterwards.
++        if (fd_ >= 0 && munmap(address, length) == 0 &&
++            mmap(address, length, PROT_NONE, MAP_PRIVATE | MAP_FIXED, fd_, static_cast<off_t>(aligned_begin)) == address) {
++            (void) mprotect(address, length, PROT_READ);
++        }
++#elif defined(MADV_DONTNEED)
+         (void) madvise(address, length, MADV_DONTNEED);
+ #elif defined(POSIX_MADV_DONTNEED)
+         (void) posix_madvise(address, length, POSIX_MADV_DONTNEED);
+@@ -123,6 +139,10 @@ void BinaryBlob::reset() noexcept {
+         mapped_ = nullptr;
+         size_ = 0;
+     }
++    if (fd_ >= 0) {
++        close(fd_);
++        fd_ = -1;
++    }
+ #elif defined(_WIN32)
+     if (mapped_ != nullptr) {
+         UnmapViewOfFile(mapped_);
+@@ -149,10 +169,16 @@ BinaryBlob read_binary_blob(const std::filesystem::path & path, bool require_map
+                 return BinaryBlob();
+             }
+             void * mapped = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+-            close(fd);
+             if (mapped != MAP_FAILED) {
+-                return BinaryBlob(static_cast<const std::byte *>(mapped), size);
++                BinaryBlob blob(static_cast<const std::byte *>(mapped), size);
++#if defined(__HAIKU__)
++                blob.fd_ = fd;
++#else
++                close(fd);
++#endif
++                return blob;
+             }
++            close(fd);
+         } else {
+             close(fd);
+         }
