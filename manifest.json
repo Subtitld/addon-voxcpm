@@ -1,7 +1,7 @@
 {
   "manifest_version": 1,
   "id": "voxcpm",
-  "version": "26.11.1",
+  "version": "26.11.2",
   "display_name": "VoxCPM2 (offline, voice clone, 30 languages)",
   "summary": "OpenBMB's VoxCPM2: speaks 30 languages at 48 kHz in the speaker's own voice, cloned from the video, or in a voice made from a description. Heavy: a 2.96 GB model downloaded on first use and about 4.5 GB of memory; on a CPU each second of speech takes several seconds to make.",
   "author": "Subtitld",
